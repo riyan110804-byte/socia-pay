@@ -472,7 +472,30 @@ def qris_caption(config, inv_id, final_amount, expires):
     return "\n".join(lines)
 
 
-async def send_qris(event, config, store, qris_semaphore):
+def paid_message(invite_link):
+    return (
+        "✅ <b>Pembayaran berhasil terdeteksi</b>\n\n"
+        "Akses VIP kamu sudah aktif. Pakai link di bawah ini untuk masuk:\n\n"
+        f"🔐 <b>Link VIP</b>\n{html.escape(invite_link)}\n\n"
+        "⚠️ Link ini hanya bisa dipakai <b>1 kali</b> dan berlaku <b>24 jam</b>."
+    )
+
+
+def invalid_payment_message():
+    return (
+        "⚠️ <b>Pembayaran belum berhasil atau QRIS sudah tidak valid</b>\n\n"
+        "QRIS sebelumnya sudah dihapus supaya tidak terscan lagi. Silakan buat QRIS baru dari tombol /start."
+    )
+
+
+def timeout_payment_message():
+    return (
+        "⏳ <b>Waktu pengecekan pembayaran habis</b>\n\n"
+        "QRIS sebelumnya sudah dihapus supaya tidak terscan lagi. Silakan buat QRIS baru dari tombol /start."
+    )
+
+
+async def send_qris(event, config, store, qris_semaphore, invoice_message=None):
     user = await event.get_sender()
     pending = store.latest_pending_for_user(user.id)
     if pending:
@@ -481,8 +504,10 @@ async def send_qris(event, config, store, qris_semaphore):
         )
         return
 
-    status_msg = await event.respond("Membuat QRIS...")
-    qris_message = None
+    if invoice_message is None:
+        invoice_message = await event.respond("⏳ Membuat QRIS...")
+    else:
+        await event.client.edit_message(event.chat_id, invoice_message.id, "⏳ Membuat QRIS...")
     try:
         async with qris_semaphore:
             _session, buyer_name, buyer_email, order_id, payment_url, qris, qr_bytes = await asyncio.to_thread(
@@ -496,16 +521,16 @@ async def send_qris(event, config, store, qris_semaphore):
         qr_file = io.BytesIO(qr_bytes)
         qr_file.name = f"{buyer_invoice_id}.png"
         payload = qris.get("data", {})
-        qris_message = await event.client.send_file(
+        invoice_message = await event.client.edit_message(
             event.chat_id,
-            qr_file,
-            caption=qris_caption(
+            invoice_message.id,
+            qris_caption(
                 config,
                 buyer_invoice_id,
                 payload.get("amount") or "",
                 payload.get("countdown") or "",
             ),
-            force_document=False,
+            file=qr_file,
             parse_mode="html",
         )
         store.create_payment(
@@ -519,9 +544,8 @@ async def send_qris(event, config, store, qris_semaphore):
             buyer_email,
             qris,
             event.chat_id,
-            qris_message.id,
+            invoice_message.id,
         )
-        await status_msg.delete()
         await send_log(
             event.client,
             config,
@@ -537,12 +561,11 @@ async def send_qris(event, config, store, qris_semaphore):
         )
     except Exception as exc:
         LOGGER.exception("Failed to create QRIS")
-        if qris_message is not None:
-            try:
-                await qris_message.delete()
-            except Exception:
-                LOGGER.warning("Failed to delete orphan QRIS message after create error", exc_info=True)
-        await status_msg.edit("Gagal membuat QRIS. Coba lagi beberapa saat lagi.")
+        try:
+            await invoice_message.delete()
+        except Exception:
+            LOGGER.warning("Failed to delete invoice message after create error", exc_info=True)
+        await event.respond("Gagal membuat QRIS. Coba lagi beberapa saat lagi.")
         await send_log(event.client, config, store, f"<b>QRIS error</b>\n<code>{html.escape(str(exc))}</code>")
 
 
@@ -594,12 +617,7 @@ async def process_paid_payment(client, config, store, payment):
         config,
         store,
         payment["user_id"],
-        (
-            "✅ <b>Pembayaran berhasil terdeteksi</b>\n\n"
-            "Akses VIP kamu sudah aktif. Pakai link di bawah ini untuk masuk:\n\n"
-            f"🔐 <b>Link VIP</b>\n{html.escape(invite_link)}\n\n"
-            "⚠️ Link ini hanya bisa dipakai <b>1 kali</b> dan berlaku <b>24 jam</b>."
-        ),
+        paid_message(invite_link),
         parse_mode="html",
         link_preview=False,
     )
@@ -657,12 +675,14 @@ async def poll_once(client, config, store, payment):
             changed = store.mark_status_if_current(payment["inv_id"], "pending", status)
             if not changed:
                 return
+            await delete_qris_message(client, payment)
             await safe_send_user(
                 client,
                 config,
                 store,
                 payment["user_id"],
-                "Pembayaran belum berhasil atau sudah tidak valid. Silakan buat QRIS baru.",
+                invalid_payment_message(),
+                parse_mode="html",
             )
             await send_log(
                 client,
@@ -703,12 +723,14 @@ async def polling_loop(client, config, store):
                 if payment["status"] == "pending" and count > config.poll_max_attempts:
                     changed = store.mark_status_if_current(payment["inv_id"], "pending", "timeout")
                     if changed:
+                        await delete_qris_message(client, payment)
                         await safe_send_user(
                             client,
                             config,
                             store,
                             payment["user_id"],
-                            "Pembayaran belum terdeteksi sampai batas waktu pengecekan. Silakan buat QRIS baru.",
+                            timeout_payment_message(),
+                            parse_mode="html",
                         )
                         await send_log(
                             client,
@@ -798,7 +820,8 @@ async def main():
             await event.answer("Buka bot lewat private chat.", alert=True)
             return
         await event.answer("Membuat QRIS...")
-        await send_qris(event, config, store, qris_semaphore)
+        invoice_message = await event.get_message()
+        await send_qris(event, config, store, qris_semaphore, invoice_message=invoice_message)
 
     @client.on(events.NewMessage(pattern=r"^/status$"))
     @private_only

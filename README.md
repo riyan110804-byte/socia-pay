@@ -42,7 +42,7 @@ Command `/setvip`, `/setlog`, dan `/config` hanya bisa dipakai Telegram user ID 
 python telegram_vip_bot.py
 ```
 
-User DM bot lalu `/start`, klik tombol `Beli VIP - Rp2.000`, scan QRIS, lalu bot akan menghapus pesan QRIS dan mengirim invite link VIP setelah pembayaran terdeteksi. Invite link berlaku 24 jam dan hanya bisa dipakai 1 kali. Log transaksi menyimpan kode pesanan internal, kode pesanan user, dan invite link yang dikirim.
+User DM bot lalu `/start`, klik tombol `Beli VIP - Rp2.000`, message tombol akan berubah menjadi invoice QRIS. Setelah pembayaran terdeteksi, bot menghapus QRIS dan mengirim invite link VIP. Kalau pembayaran gagal/expired/tidak valid, bot juga menghapus QRIS supaya tidak terscan lagi. Invite link berlaku 24 jam dan hanya bisa dipakai 1 kali. Log transaksi menyimpan kode pesanan internal, kode pesanan user, dan invite link yang dikirim.
 
 Kalau database sudah pernah dibuat sebelum versi ini, jalankan ulang isi `supabase_schema.sql` di SQL Editor supaya kolom `public_invoice_id`, `qris_chat_id`, `qris_message_id`, dan status recovery production ikut aktif.
 
