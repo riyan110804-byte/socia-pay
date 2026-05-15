@@ -46,6 +46,8 @@ User DM bot lalu `/start`, klik tombol `Beli VIP - Rp2.000`, scan QRIS, lalu bot
 
 Kalau database sudah pernah dibuat sebelum versi ini, jalankan ulang isi `supabase_schema.sql` di SQL Editor supaya kolom `public_invoice_id`, `qris_chat_id`, `qris_message_id`, dan status recovery production ikut aktif.
 
+Bot membatasi pembuatan QRIS bersamaan lewat `QRIS_CREATE_CONCURRENCY` supaya traffic ramai tetap antre rapi. Default `5` cukup aman untuk awal; naikkan pelan-pelan kalau SociaBuzz tetap stabil.
+
 ## Deploy Railway
 
 Project sudah punya `railway.json`, jadi Railway akan start worker dengan:
@@ -71,6 +73,7 @@ Set variables ini di Railway:
 - `INVITE_EXPIRE_HOURS=24`
 - `POLL_INTERVAL_SECONDS=3`
 - `POLL_MAX_ATTEMPTS=300`
+- `QRIS_CREATE_CONCURRENCY=5`
 
 State invoice disimpan di Supabase, jadi Railway tidak perlu Volume. Gunakan `service_role` key hanya di Railway Variables, jangan taruh di frontend atau repo.
 

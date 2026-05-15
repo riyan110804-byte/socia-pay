@@ -73,6 +73,16 @@ CHECK (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_vip_payments_public_invoice_id
 ON public.vip_payments (public_invoice_id);
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_vip_payments_one_active_per_user
+ON public.vip_payments (user_id)
+WHERE status IN (
+    'pending',
+    'processing_paid',
+    'invite_error',
+    'processing_delivery',
+    'delivery_error'
+);
+
 ALTER TABLE public.vip_payments ENABLE ROW LEVEL SECURITY;
 
 REVOKE ALL ON public.vip_payments FROM anon, authenticated;

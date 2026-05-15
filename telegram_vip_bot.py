@@ -86,6 +86,7 @@ class Config:
     invite_expire_hours: int
     poll_interval_seconds: int
     poll_max_attempts: int
+    qris_create_concurrency: int
     admin_user_ids: set[int]
     supabase_url: str
     supabase_service_role_key: str
@@ -135,6 +136,7 @@ def load_config():
         invite_expire_hours=env_int("INVITE_EXPIRE_HOURS", 24),
         poll_interval_seconds=env_int("POLL_INTERVAL_SECONDS", 3),
         poll_max_attempts=env_int("POLL_MAX_ATTEMPTS", 300),
+        qris_create_concurrency=max(1, env_int("QRIS_CREATE_CONCURRENCY", 5)),
         admin_user_ids=parse_admin_ids(os.getenv("ADMIN_USER_IDS", "")),
         supabase_url=env_required("SUPABASE_URL"),
         supabase_service_role_key=env_required("SUPABASE_SERVICE_ROLE_KEY"),
@@ -470,7 +472,7 @@ def qris_caption(config, inv_id, final_amount, expires):
     return "\n".join(lines)
 
 
-async def send_qris(event, config, store):
+async def send_qris(event, config, store, qris_semaphore):
     user = await event.get_sender()
     pending = store.latest_pending_for_user(user.id)
     if pending:
@@ -482,9 +484,10 @@ async def send_qris(event, config, store):
     status_msg = await event.respond("Membuat QRIS...")
     qris_message = None
     try:
-        _session, buyer_name, buyer_email, order_id, payment_url, qris, qr_bytes = await asyncio.to_thread(
-            create_qris_sync, config, user
-        )
+        async with qris_semaphore:
+            _session, buyer_name, buyer_email, order_id, payment_url, qris, qr_bytes = await asyncio.to_thread(
+                create_qris_sync, config, user
+            )
         socia_invoice_id = qris.get("inv_id")
         if not socia_invoice_id:
             raise SociaBuzzError(f"QRIS response missing inv_id: {qris}")
@@ -747,9 +750,20 @@ def parse_chat_setting(event, raw_value):
     return int(value)
 
 
-async def require_admin(event, config):
+async def require_admin(event, config, store):
     if is_admin(config, event.sender_id):
         return True
+    await send_log(
+        event.client,
+        config,
+        store,
+        (
+            "<b>Unauthorized admin command</b>\n"
+            f"User: <code>{event.sender_id}</code>\n"
+            f"Chat: <code>{event.chat_id}</code>\n"
+            f"Command: <code>{html.escape(event.raw_text or '')}</code>"
+        ),
+    )
     await event.respond("Command ini khusus admin.")
     return False
 
@@ -758,6 +772,7 @@ async def main():
     config = load_config()
     store = PaymentStore(config)
     client = TelegramClient("vip_bot", config.api_id, config.api_hash)
+    qris_semaphore = asyncio.Semaphore(config.qris_create_concurrency)
 
     @client.on(events.NewMessage(pattern=r"^/start$"))
     @private_only
@@ -775,7 +790,7 @@ async def main():
     @client.on(events.NewMessage(pattern=r"^/buy$"))
     @private_only
     async def buy_command(event):
-        await send_qris(event, config, store)
+        await send_qris(event, config, store, qris_semaphore)
 
     @client.on(events.CallbackQuery(data=b"buy_vip"))
     async def buy_callback(event):
@@ -783,7 +798,7 @@ async def main():
             await event.answer("Buka bot lewat private chat.", alert=True)
             return
         await event.answer("Membuat QRIS...")
-        await send_qris(event, config, store)
+        await send_qris(event, config, store, qris_semaphore)
 
     @client.on(events.NewMessage(pattern=r"^/status$"))
     @private_only
@@ -800,11 +815,13 @@ async def main():
 
     @client.on(events.NewMessage(pattern=r"^/chatid$"))
     async def chat_id(event):
+        if not event.is_private and not await require_admin(event, config, store):
+            return
         await event.respond(f"chat_id: `{event.chat_id}`")
 
     @client.on(events.NewMessage(pattern=r"^/setvip(?:\s+(.+))?$"))
     async def set_vip(event):
-        if not await require_admin(event, config):
+        if not await require_admin(event, config, store):
             return
         raw_value = event.pattern_match.group(1)
         if not raw_value:
@@ -820,7 +837,7 @@ async def main():
 
     @client.on(events.NewMessage(pattern=r"^/setlog(?:\s+(.+))?$"))
     async def set_log(event):
-        if not await require_admin(event, config):
+        if not await require_admin(event, config, store):
             return
         raw_value = event.pattern_match.group(1)
         if not raw_value:
@@ -836,7 +853,7 @@ async def main():
 
     @client.on(events.NewMessage(pattern=r"^/config$"))
     async def show_config(event):
-        if not await require_admin(event, config):
+        if not await require_admin(event, config, store):
             return
         vip_chat_id = runtime_vip_chat_id(config, store)
         log_chat_id = runtime_log_chat_id(config, store)
