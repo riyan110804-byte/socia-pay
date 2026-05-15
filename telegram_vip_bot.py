@@ -362,6 +362,11 @@ def user_link(row):
     return f'<a href="tg://user?id={row["user_id"]}">{name}</a>'
 
 
+def telegram_user_link(user):
+    name = html.escape(display_name(user))
+    return f'<a href="tg://user?id={user.id}">{name}</a>'
+
+
 def is_admin(config, user_id):
     return user_id in config.admin_user_ids
 
@@ -558,7 +563,7 @@ async def send_qris(event, config, store, qris_semaphore, invoice_message=None):
             store,
             (
                 "<b>QRIS created</b>\n"
-                f"User: {html.escape(display_name(user))} (<code>{user.id}</code>)\n"
+                f"User: {telegram_user_link(user)} (<code>{user.id}</code>)\n"
                 f"Invoice: <code>{html.escape(buyer_invoice_id)}</code>\n"
                 f"Internal invoice: <code>{html.escape(socia_invoice_id)}</code>\n"
                 f"Order: <code>{html.escape(order_id)}</code>\n"
