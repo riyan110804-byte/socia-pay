@@ -8,7 +8,20 @@ CREATE TABLE IF NOT EXISTS public.vip_payments (
     payment_url TEXT NOT NULL,
     inv_id TEXT NOT NULL UNIQUE,
     amount INTEGER NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('pending', 'paid', 'failed_or_expired', 'unknown', 'poll_error', 'timeout')),
+    status TEXT NOT NULL CHECK (
+        status IN (
+            'pending',
+            'processing_paid',
+            'invite_error',
+            'processing_delivery',
+            'delivery_error',
+            'paid',
+            'failed_or_expired',
+            'unknown',
+            'poll_error',
+            'timeout'
+        )
+    ),
     buyer_name TEXT NOT NULL,
     buyer_email TEXT NOT NULL,
     qris_amount TEXT NOT NULL DEFAULT '',
@@ -36,6 +49,26 @@ ADD COLUMN IF NOT EXISTS qris_chat_id BIGINT;
 
 ALTER TABLE public.vip_payments
 ADD COLUMN IF NOT EXISTS qris_message_id BIGINT;
+
+ALTER TABLE public.vip_payments
+DROP CONSTRAINT IF EXISTS vip_payments_status_check;
+
+ALTER TABLE public.vip_payments
+ADD CONSTRAINT vip_payments_status_check
+CHECK (
+    status IN (
+        'pending',
+        'processing_paid',
+        'invite_error',
+        'processing_delivery',
+        'delivery_error',
+        'paid',
+        'failed_or_expired',
+        'unknown',
+        'poll_error',
+        'timeout'
+    )
+);
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_vip_payments_public_invoice_id
 ON public.vip_payments (public_invoice_id);

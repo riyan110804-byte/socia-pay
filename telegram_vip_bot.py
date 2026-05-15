@@ -69,6 +69,9 @@ LAST_NAMES = [
     "Lestari",
 ]
 
+ACTIVE_PAYMENT_STATUSES = ("pending", "processing_paid", "invite_error", "delivery_error", "processing_delivery")
+RETRYABLE_PAYMENT_STATUSES = ("pending", "invite_error", "delivery_error")
+
 
 @dataclass(frozen=True)
 class Config:
@@ -183,35 +186,99 @@ class PaymentStore:
         self.client.table(self.table).insert(data).execute()
 
     def latest_pending_for_user(self, user_id):
-        response = (
-            self.client.table(self.table)
-            .select("*")
-            .eq("user_id", user_id)
-            .eq("status", "pending")
-            .order("id", desc=True)
-            .limit(1)
-            .execute()
-        )
-        return response.data[0] if response.data else None
+        rows = []
+        for status in ACTIVE_PAYMENT_STATUSES:
+            response = (
+                self.client.table(self.table)
+                .select("*")
+                .eq("user_id", user_id)
+                .eq("status", status)
+                .order("id", desc=True)
+                .limit(1)
+                .execute()
+            )
+            rows.extend(response.data or [])
+        rows.sort(key=lambda item: item["id"], reverse=True)
+        return rows[0] if rows else None
 
-    def pending_payments(self):
-        response = (
-            self.client.table(self.table)
-            .select("*")
-            .eq("status", "pending")
-            .order("id", desc=False)
-            .execute()
-        )
-        return response.data or []
+    def retryable_payments(self):
+        rows = []
+        for status in RETRYABLE_PAYMENT_STATUSES:
+            response = (
+                self.client.table(self.table)
+                .select("*")
+                .eq("status", status)
+                .order("id", desc=False)
+                .execute()
+            )
+            rows.extend(response.data or [])
+        rows.sort(key=lambda item: item["id"])
+        return rows
+
+    def recover_stale_processing(self, older_than_seconds=300):
+        cutoff = (dt.datetime.now(dt.UTC) - dt.timedelta(seconds=older_than_seconds)).replace(microsecond=0).isoformat()
+        now = utc_now_iso()
+        self.client.table(self.table).update(
+            {
+                "status": "invite_error",
+                "error": "Recovered stale paid processing",
+                "updated_at": now,
+            }
+        ).eq("status", "processing_paid").lt("updated_at", cutoff).execute()
+        self.client.table(self.table).update(
+            {
+                "status": "delivery_error",
+                "error": "Recovered stale delivery processing",
+                "updated_at": now,
+            }
+        ).eq("status", "processing_delivery").lt("updated_at", cutoff).execute()
 
     def get_by_inv_id(self, inv_id):
         response = self.client.table(self.table).select("*").eq("inv_id", inv_id).limit(1).execute()
         return response.data[0] if response.data else None
 
-    def mark_status(self, inv_id, status, error=""):
+    def set_error(self, inv_id, error):
         self.client.table(self.table).update(
-            {"status": status, "error": error, "updated_at": utc_now_iso()}
+            {"error": error[:1000], "updated_at": utc_now_iso()}
         ).eq("inv_id", inv_id).execute()
+
+    def mark_status_if_current(self, inv_id, from_status, to_status, error=""):
+        response = self.client.table(self.table).update(
+            {"status": to_status, "error": error, "updated_at": utc_now_iso()}
+        ).eq("inv_id", inv_id).eq("status", from_status).execute()
+        return bool(response.data)
+
+    def claim_paid_processing(self, inv_id):
+        return self.mark_status_if_current(inv_id, "pending", "processing_paid") or self.mark_status_if_current(
+            inv_id, "invite_error", "processing_paid"
+        )
+
+    def mark_invite_error(self, inv_id, error):
+        return self.mark_status_if_current(inv_id, "processing_paid", "invite_error", error[:1000])
+
+    def mark_delivery_processing(self, inv_id, invite_link, invite_expires_at):
+        response = (
+            self.client.table(self.table)
+            .update(
+                {
+                    "status": "processing_delivery",
+                    "invite_link": invite_link,
+                    "invite_expires_at": invite_expires_at,
+                    "error": "",
+                    "updated_at": utc_now_iso(),
+                }
+            )
+            .eq("inv_id", inv_id)
+            .eq("status", "processing_paid")
+            .execute()
+        )
+        return bool(response.data)
+
+    def claim_delivery_processing(self, inv_id):
+        return self.mark_status_if_current(inv_id, "delivery_error", "processing_delivery")
+
+    def mark_delivery_error(self, inv_id, error):
+        return self.mark_status_if_current(inv_id, "processing_delivery", "delivery_error", error[:1000])
 
     def mark_paid(self, inv_id, invite_link, invite_expires_at):
         response = (
@@ -225,7 +292,7 @@ class PaymentStore:
                 }
             )
             .eq("inv_id", inv_id)
-            .eq("status", "pending")
+            .eq("status", "processing_delivery")
             .execute()
         )
         return bool(response.data)
@@ -306,13 +373,36 @@ def runtime_log_chat_id(config, store):
 
 
 async def send_log(client, config, store, text):
-    log_chat_id = runtime_log_chat_id(config, store)
+    try:
+        log_chat_id = runtime_log_chat_id(config, store)
+    except Exception as exc:
+        LOGGER.warning("Failed to load runtime log_chat_id, falling back to env: %s", exc)
+        log_chat_id = config.log_chat_id
     if not log_chat_id:
         return
     try:
         await client.send_message(log_chat_id, text, parse_mode="html", link_preview=False)
     except Exception as exc:
         LOGGER.warning("Failed to send log message to %s: %s", log_chat_id, exc)
+
+
+async def safe_send_user(client, config, store, user_id, text, **kwargs):
+    try:
+        await client.send_message(user_id, text, **kwargs)
+        return True
+    except Exception as exc:
+        LOGGER.exception("Failed to send message to user %s", user_id)
+        await send_log(
+            client,
+            config,
+            store,
+            (
+                "<b>User delivery error</b>\n"
+                f"User: <code>{user_id}</code>\n"
+                f"Error: <code>{html.escape(str(exc))}</code>"
+            ),
+        )
+        return False
 
 
 def create_qris_sync(config, user):
@@ -390,6 +480,7 @@ async def send_qris(event, config, store):
         return
 
     status_msg = await event.respond("Membuat QRIS...")
+    qris_message = None
     try:
         _session, buyer_name, buyer_email, order_id, payment_url, qris, qr_bytes = await asyncio.to_thread(
             create_qris_sync, config, user
@@ -443,18 +534,62 @@ async def send_qris(event, config, store):
         )
     except Exception as exc:
         LOGGER.exception("Failed to create QRIS")
+        if qris_message is not None:
+            try:
+                await qris_message.delete()
+            except Exception:
+                LOGGER.warning("Failed to delete orphan QRIS message after create error", exc_info=True)
         await status_msg.edit("Gagal membuat QRIS. Coba lagi beberapa saat lagi.")
         await send_log(event.client, config, store, f"<b>QRIS error</b>\n<code>{html.escape(str(exc))}</code>")
 
 
 async def process_paid_payment(client, config, store, payment):
-    invite_link, invite_expires_at = await create_invite_link(client, config, store, payment)
-    changed = store.mark_paid(payment["inv_id"], invite_link, invite_expires_at)
-    if not changed:
-        return
+    if payment["status"] == "delivery_error":
+        if not store.claim_delivery_processing(payment["inv_id"]):
+            return
+        invite_link = payment.get("invite_link") or ""
+        invite_expires_at = payment.get("invite_expires_at") or ""
+        if not invite_link:
+            store.mark_delivery_error(payment["inv_id"], "Missing invite_link for delivery retry")
+            await send_log(
+                client,
+                config,
+                store,
+                (
+                    "<b>Delivery retry error</b>\n"
+                    f"Invoice: <code>{html.escape(payment.get('public_invoice_id') or payment['inv_id'])}</code>\n"
+                    "Error: <code>Missing invite_link for delivery retry</code>"
+                ),
+            )
+            return
+    else:
+        if not store.claim_paid_processing(payment["inv_id"]):
+            return
+        try:
+            invite_link, invite_expires_at = await create_invite_link(client, config, store, payment)
+        except Exception as exc:
+            LOGGER.exception("Failed to create invite link for %s", payment["inv_id"])
+            store.mark_invite_error(payment["inv_id"], str(exc))
+            await send_log(
+                client,
+                config,
+                store,
+                (
+                    "<b>Invite creation error</b>\n"
+                    f"Invoice: <code>{html.escape(payment.get('public_invoice_id') or payment['inv_id'])}</code>\n"
+                    f"Internal invoice: <code>{html.escape(payment['inv_id'])}</code>\n"
+                    f"Error: <code>{html.escape(str(exc))}</code>"
+                ),
+            )
+            return
+        if not store.mark_delivery_processing(payment["inv_id"], invite_link, invite_expires_at):
+            return
 
     await delete_qris_message(client, payment)
-    await client.send_message(
+    delivered = await safe_send_user(
+        client,
+        config,
+        store,
         payment["user_id"],
         (
             "✅ <b>Pembayaran berhasil terdeteksi</b>\n\n"
@@ -465,6 +600,14 @@ async def process_paid_payment(client, config, store, payment):
         parse_mode="html",
         link_preview=False,
     )
+    if not delivered:
+        store.mark_delivery_error(payment["inv_id"], "Failed to send invite link to user")
+        return
+
+    changed = store.mark_paid(payment["inv_id"], invite_link, invite_expires_at)
+    if not changed:
+        return
+
     await send_log(
         client,
         config,
@@ -499,13 +642,22 @@ async def delete_qris_message(client, payment):
 
 async def poll_once(client, config, store, payment):
     try:
+        if payment["status"] in {"invite_error", "delivery_error"}:
+            await process_paid_payment(client, config, store, payment)
+            return
+
         status, status_url, elapsed_ms = await asyncio.to_thread(check_payment_sync, config, payment["inv_id"])
         LOGGER.info("Invoice %s status=%s latency=%sms", payment["inv_id"], status, elapsed_ms)
         if status == "paid":
             await process_paid_payment(client, config, store, payment)
         elif status in {"failed_or_expired", "unknown"}:
-            store.mark_status(payment["inv_id"], status)
-            await client.send_message(
+            changed = store.mark_status_if_current(payment["inv_id"], "pending", status)
+            if not changed:
+                return
+            await safe_send_user(
+                client,
+                config,
+                store,
                 payment["user_id"],
                 "Pembayaran belum berhasil atau sudah tidak valid. Silakan buat QRIS baru.",
             )
@@ -522,7 +674,8 @@ async def poll_once(client, config, store, payment):
             )
     except Exception as exc:
         LOGGER.exception("Polling failed for %s", payment["inv_id"])
-        store.mark_status(payment["inv_id"], "poll_error", str(exc))
+        if payment["status"] == "pending":
+            store.set_error(payment["inv_id"], str(exc))
         await send_log(
             client,
             config,
@@ -538,28 +691,43 @@ async def poll_once(client, config, store, payment):
 async def polling_loop(client, config, store):
     attempts = {}
     while True:
-        pending = store.pending_payments()
-        for payment in pending:
-            count = attempts.get(payment["inv_id"], 0) + 1
-            attempts[payment["inv_id"]] = count
-            if count > config.poll_max_attempts:
-                store.mark_status(payment["inv_id"], "timeout")
-                await client.send_message(
-                    payment["user_id"],
-                    "Pembayaran belum terdeteksi sampai batas waktu pengecekan. Silakan buat QRIS baru.",
-                )
-                await send_log(
-                    client,
-                    config,
-                    store,
-                    (
-                        "<b>Payment timeout</b>\n"
-                        f"User: {user_link(payment)} (<code>{payment['user_id']}</code>)\n"
-                        f"Invoice: <code>{html.escape(payment['inv_id'])}</code>"
-                    ),
-                )
-                continue
-            await poll_once(client, config, store, payment)
+        try:
+            store.recover_stale_processing()
+            pending = store.retryable_payments()
+            for payment in pending:
+                count = attempts.get(payment["inv_id"], 0) + 1
+                attempts[payment["inv_id"]] = count
+                if payment["status"] == "pending" and count > config.poll_max_attempts:
+                    changed = store.mark_status_if_current(payment["inv_id"], "pending", "timeout")
+                    if changed:
+                        await safe_send_user(
+                            client,
+                            config,
+                            store,
+                            payment["user_id"],
+                            "Pembayaran belum terdeteksi sampai batas waktu pengecekan. Silakan buat QRIS baru.",
+                        )
+                        await send_log(
+                            client,
+                            config,
+                            store,
+                            (
+                                "<b>Payment timeout</b>\n"
+                                f"User: {user_link(payment)} (<code>{payment['user_id']}</code>)\n"
+                                f"Invoice: <code>{html.escape(payment.get('public_invoice_id') or payment['inv_id'])}</code>\n"
+                                f"Internal invoice: <code>{html.escape(payment['inv_id'])}</code>"
+                            ),
+                        )
+                    continue
+                await poll_once(client, config, store, payment)
+        except Exception as exc:
+            LOGGER.exception("Polling loop error")
+            await send_log(
+                client,
+                config,
+                store,
+                f"<b>Polling loop error</b>\n<code>{html.escape(str(exc))}</code>",
+            )
         await asyncio.sleep(config.poll_interval_seconds)
 
 
