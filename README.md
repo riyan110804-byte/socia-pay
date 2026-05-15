@@ -67,6 +67,8 @@ Set variables ini di Railway:
 - `SUPABASE_SERVICE_ROLE_KEY`
 - `SUPABASE_TABLE=vip_payments`
 - `SUPABASE_SETTINGS_TABLE=vip_bot_settings`
+- `SUPABASE_QUERY_RETRIES=3`
+- `SUPABASE_RETRY_BASE_DELAY=0.35`
 - `ADMIN_USER_IDS`
 - `SOCIABUZZ_USERNAME`
 - `PAYMENT_AMOUNT=2000`
@@ -76,6 +78,8 @@ Set variables ini di Railway:
 - `QRIS_CREATE_CONCURRENCY=5`
 
 State invoice disimpan di Supabase, jadi Railway tidak perlu Volume. Gunakan `service_role` key hanya di Railway Variables, jangan taruh di frontend atau repo.
+
+Kalau Supabase/PostgREST memutus koneksi HTTP/2 saat polling, bot akan retry query Supabase sesuai `SUPABASE_QUERY_RETRIES` sebelum menulis error ke log channel.
 
 ## Test QRIS Flow Saja
 

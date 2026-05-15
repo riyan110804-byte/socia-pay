@@ -8,8 +8,10 @@ import os
 import random
 import secrets
 import string
+import time
 from dataclasses import dataclass
 
+import httpx
 from dotenv import load_dotenv
 from supabase import create_client
 from telethon import Button, TelegramClient, events, functions
@@ -149,6 +151,26 @@ class PaymentStore:
         self.table = config.supabase_table
         self.settings_table = os.getenv("SUPABASE_SETTINGS_TABLE", "vip_bot_settings").strip() or "vip_bot_settings"
         self.client = create_client(config.supabase_url, config.supabase_service_role_key)
+        self.query_retries = max(1, env_int("SUPABASE_QUERY_RETRIES", 3))
+        self.retry_base_delay = max(0.1, float(os.getenv("SUPABASE_RETRY_BASE_DELAY", "0.35")))
+
+    def _execute(self, query, action):
+        for attempt in range(1, self.query_retries + 1):
+            try:
+                return query.execute()
+            except httpx.TransportError as exc:
+                if attempt >= self.query_retries:
+                    raise
+                delay = min(4.0, self.retry_base_delay * (2 ** (attempt - 1))) + random.uniform(0, 0.15)
+                LOGGER.warning(
+                    "Transient Supabase transport error during %s, retrying in %.2fs (%s/%s): %s",
+                    action,
+                    delay,
+                    attempt,
+                    self.query_retries,
+                    exc,
+                )
+                time.sleep(delay)
 
     def create_payment(
         self,
@@ -185,20 +207,20 @@ class PaymentStore:
             "created_at": now,
             "updated_at": now,
         }
-        self.client.table(self.table).insert(data).execute()
+        self._execute(self.client.table(self.table).insert(data), "create payment")
 
     def latest_pending_for_user(self, user_id):
         rows = []
         for status in ACTIVE_PAYMENT_STATUSES:
-            response = (
+            query = (
                 self.client.table(self.table)
                 .select("*")
                 .eq("user_id", user_id)
                 .eq("status", status)
                 .order("id", desc=True)
                 .limit(1)
-                .execute()
             )
+            response = self._execute(query, f"latest active payment {status}")
             rows.extend(response.data or [])
         rows.sort(key=lambda item: item["id"], reverse=True)
         return rows[0] if rows else None
@@ -206,13 +228,13 @@ class PaymentStore:
     def retryable_payments(self):
         rows = []
         for status in RETRYABLE_PAYMENT_STATUSES:
-            response = (
+            query = (
                 self.client.table(self.table)
                 .select("*")
                 .eq("status", status)
                 .order("id", desc=False)
-                .execute()
             )
+            response = self._execute(query, f"retryable payments {status}")
             rows.extend(response.data or [])
         rows.sort(key=lambda item: item["id"])
         return rows
@@ -220,34 +242,39 @@ class PaymentStore:
     def recover_stale_processing(self, older_than_seconds=300):
         cutoff = (dt.datetime.now(dt.UTC) - dt.timedelta(seconds=older_than_seconds)).replace(microsecond=0).isoformat()
         now = utc_now_iso()
-        self.client.table(self.table).update(
+        query = self.client.table(self.table).update(
             {
                 "status": "invite_error",
                 "error": "Recovered stale paid processing",
                 "updated_at": now,
             }
-        ).eq("status", "processing_paid").lt("updated_at", cutoff).execute()
-        self.client.table(self.table).update(
+        ).eq("status", "processing_paid").lt("updated_at", cutoff)
+        self._execute(query, "recover stale paid processing")
+        query = self.client.table(self.table).update(
             {
                 "status": "delivery_error",
                 "error": "Recovered stale delivery processing",
                 "updated_at": now,
             }
-        ).eq("status", "processing_delivery").lt("updated_at", cutoff).execute()
+        ).eq("status", "processing_delivery").lt("updated_at", cutoff)
+        self._execute(query, "recover stale delivery processing")
 
     def get_by_inv_id(self, inv_id):
-        response = self.client.table(self.table).select("*").eq("inv_id", inv_id).limit(1).execute()
+        query = self.client.table(self.table).select("*").eq("inv_id", inv_id).limit(1)
+        response = self._execute(query, "get payment by invoice")
         return response.data[0] if response.data else None
 
     def set_error(self, inv_id, error):
-        self.client.table(self.table).update(
+        query = self.client.table(self.table).update(
             {"error": error[:1000], "updated_at": utc_now_iso()}
-        ).eq("inv_id", inv_id).execute()
+        ).eq("inv_id", inv_id)
+        self._execute(query, "set payment error")
 
     def mark_status_if_current(self, inv_id, from_status, to_status, error=""):
-        response = self.client.table(self.table).update(
+        query = self.client.table(self.table).update(
             {"status": to_status, "error": error, "updated_at": utc_now_iso()}
-        ).eq("inv_id", inv_id).eq("status", from_status).execute()
+        ).eq("inv_id", inv_id).eq("status", from_status)
+        response = self._execute(query, f"mark status {from_status} to {to_status}")
         return bool(response.data)
 
     def claim_paid_processing(self, inv_id):
@@ -259,7 +286,7 @@ class PaymentStore:
         return self.mark_status_if_current(inv_id, "processing_paid", "invite_error", error[:1000])
 
     def mark_delivery_processing(self, inv_id, invite_link, invite_expires_at):
-        response = (
+        query = (
             self.client.table(self.table)
             .update(
                 {
@@ -272,8 +299,8 @@ class PaymentStore:
             )
             .eq("inv_id", inv_id)
             .eq("status", "processing_paid")
-            .execute()
         )
+        response = self._execute(query, "mark delivery processing")
         return bool(response.data)
 
     def claim_delivery_processing(self, inv_id):
@@ -283,7 +310,7 @@ class PaymentStore:
         return self.mark_status_if_current(inv_id, "processing_delivery", "delivery_error", error[:1000])
 
     def mark_paid(self, inv_id, invite_link, invite_expires_at):
-        response = (
+        query = (
             self.client.table(self.table)
             .update(
                 {
@@ -295,22 +322,24 @@ class PaymentStore:
             )
             .eq("inv_id", inv_id)
             .eq("status", "processing_delivery")
-            .execute()
         )
+        response = self._execute(query, "mark paid")
         return bool(response.data)
 
     def get_setting(self, key, default=""):
-        response = self.client.table(self.settings_table).select("value").eq("key", key).limit(1).execute()
+        query = self.client.table(self.settings_table).select("value").eq("key", key).limit(1)
+        response = self._execute(query, "get bot setting")
         if not response.data:
             return default
         return response.data[0].get("value") or default
 
     def set_setting(self, key, value):
         now = utc_now_iso()
-        self.client.table(self.settings_table).upsert(
+        query = self.client.table(self.settings_table).upsert(
             {"key": key, "value": str(value), "updated_at": now},
             on_conflict="key",
-        ).execute()
+        )
+        self._execute(query, "set bot setting")
 
     def get_int_setting(self, key, default=0):
         value = self.get_setting(key, "")
