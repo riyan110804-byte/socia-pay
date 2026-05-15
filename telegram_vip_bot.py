@@ -483,16 +483,22 @@ def paid_message(invite_link):
 
 def invalid_payment_message():
     return (
-        "⚠️ <b>Pembayaran belum berhasil atau QRIS sudah tidak valid</b>\n\n"
-        "QRIS sebelumnya sudah dihapus supaya tidak terscan lagi. Silakan buat QRIS baru dari tombol /start."
+        "⚠️ <b>QRIS sebelumnya sudah tidak aktif</b>\n\n"
+        "Slot VIP kamu masih bisa diamankan. Buat QRIS baru sekarang, selesaikan pembayaran 1 kali, "
+        "dan link member VIP akan dikirim otomatis setelah pembayaran terdeteksi."
     )
 
 
 def timeout_payment_message():
     return (
-        "⏳ <b>Waktu pengecekan pembayaran habis</b>\n\n"
-        "QRIS sebelumnya sudah dihapus supaya tidak terscan lagi. Silakan buat QRIS baru dari tombol /start."
+        "⏳ <b>Invoice VIP sudah kedaluwarsa</b>\n\n"
+        "QRIS lama sudah ditutup supaya tidak salah scan. Klik tombol di bawah untuk checkout ulang "
+        "dan lanjut masuk ke group member VIP."
     )
+
+
+def buy_buttons(config):
+    return [[Button.inline(f"Buat QRIS Baru - {format_rupiah(config.payment_amount)}", b"buy_vip")]]
 
 
 async def send_qris(event, config, store, qris_semaphore, invoice_message=None):
@@ -683,6 +689,7 @@ async def poll_once(client, config, store, payment):
                 payment["user_id"],
                 invalid_payment_message(),
                 parse_mode="html",
+                buttons=buy_buttons(config),
             )
             await send_log(
                 client,
@@ -731,6 +738,7 @@ async def polling_loop(client, config, store):
                             payment["user_id"],
                             timeout_payment_message(),
                             parse_mode="html",
+                            buttons=buy_buttons(config),
                         )
                         await send_log(
                             client,
