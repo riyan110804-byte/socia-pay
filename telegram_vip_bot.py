@@ -30,6 +30,8 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 LOGGER = logging.getLogger("telegram_vip_bot")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telethon").setLevel(logging.WARNING)
 
 
 FIRST_NAMES = [
@@ -272,8 +274,8 @@ async def send_log(client, config, store, text):
         return
     try:
         await client.send_message(log_chat_id, text, parse_mode="html", link_preview=False)
-    except Exception:
-        LOGGER.exception("Failed to send log message")
+    except Exception as exc:
+        LOGGER.warning("Failed to send log message to %s: %s", log_chat_id, exc)
 
 
 def create_qris_sync(config, user):

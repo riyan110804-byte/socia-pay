@@ -23,7 +23,7 @@ Bot harus menjadi admin di `VIP_CHAT_ID` dengan permission invite users.
 
 Jalankan SQL di `supabase_schema.sql` lewat Supabase SQL Editor sebelum bot dijalankan.
 
-`VIP_CHAT_ID` dan `LOG_CHAT_ID` bisa dikosongkan di Railway kalau mau di-set dari Telegram:
+`VIP_CHAT_ID` dan `LOG_CHAT_ID` bisa dikosongkan di Railway kalau mau di-set dari Telegram. Ini lebih aman untuk first deploy supaya startup bot tidak gagal kirim log ke chat yang belum benar:
 
 ```text
 /chatid
