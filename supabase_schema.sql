@@ -73,6 +73,31 @@ CHECK (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_vip_payments_public_invoice_id
 ON public.vip_payments (public_invoice_id);
 
+WITH ranked_active_payments AS (
+    SELECT
+        id,
+        row_number() OVER (
+            PARTITION BY user_id
+            ORDER BY created_at DESC, id DESC
+        ) AS active_rank
+    FROM public.vip_payments
+    WHERE status IN (
+        'pending',
+        'processing_paid',
+        'invite_error',
+        'processing_delivery',
+        'delivery_error'
+    )
+)
+UPDATE public.vip_payments AS payment
+SET
+    status = 'timeout',
+    error = 'Closed duplicate active payment before one-active-per-user index',
+    updated_at = now()
+FROM ranked_active_payments AS ranked
+WHERE payment.id = ranked.id
+  AND ranked.active_rank > 1;
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_vip_payments_one_active_per_user
 ON public.vip_payments (user_id)
 WHERE status IN (
