@@ -7,6 +7,7 @@ import logging
 import os
 import random
 import secrets
+import string
 from dataclasses import dataclass
 
 from dotenv import load_dotenv
@@ -144,13 +145,27 @@ class PaymentStore:
         self.settings_table = os.getenv("SUPABASE_SETTINGS_TABLE", "vip_bot_settings").strip() or "vip_bot_settings"
         self.client = create_client(config.supabase_url, config.supabase_service_role_key)
 
-    def create_payment(self, user, order_id, payment_url, inv_id, amount, buyer_name, buyer_email, qris_data):
+    def create_payment(
+        self,
+        user,
+        public_invoice_id,
+        order_id,
+        payment_url,
+        inv_id,
+        amount,
+        buyer_name,
+        buyer_email,
+        qris_data,
+        qris_chat_id,
+        qris_message_id,
+    ):
         now = utc_now_iso()
         payload = qris_data.get("data", {})
         data = {
             "user_id": user.id,
             "username": user.username or "",
             "full_name": display_name(user),
+            "public_invoice_id": public_invoice_id,
             "order_id": order_id,
             "payment_url": payment_url,
             "inv_id": inv_id,
@@ -160,6 +175,8 @@ class PaymentStore:
             "buyer_email": buyer_email,
             "qris_amount": payload.get("amount") or "",
             "qris_expires": payload.get("countdown") or "",
+            "qris_chat_id": qris_chat_id,
+            "qris_message_id": qris_message_id,
             "created_at": now,
             "updated_at": now,
         }
@@ -251,6 +268,26 @@ def random_indonesian_identity():
     return f"{first} {last}", email
 
 
+def public_invoice_id():
+    date_part = dt.datetime.now(dt.timezone(dt.timedelta(hours=7))).strftime("%y%m%d")
+    suffix = "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(6))
+    return f"VIP-{date_part}-{suffix}"
+
+
+def format_rupiah(amount):
+    return f"Rp{amount:,}".replace(",", ".")
+
+
+def format_qris_expiry(raw_expires):
+    if not raw_expires:
+        return ""
+    try:
+        parsed = dt.datetime.fromisoformat(raw_expires)
+    except ValueError:
+        return raw_expires
+    return parsed.strftime("%d/%m/%Y %H:%M WIB")
+
+
 def user_link(row):
     name = html.escape(row["full_name"] or str(row["user_id"]))
     return f'<a href="tg://user?id={row["user_id"]}">{name}</a>'
@@ -317,17 +354,29 @@ async def create_invite_link(client, config, store, payment):
 
 
 def qris_caption(config, inv_id, final_amount, expires):
+    public_invoice = html.escape(inv_id)
+    human_expires = html.escape(format_qris_expiry(expires))
     lines = [
-        "Scan QRIS ini untuk pembayaran VIP.",
-        f"Paket: Rp{config.payment_amount:,}".replace(",", "."),
-        f"Invoice: {inv_id}",
+        "🔥 <b>Akses VIP Premium</b>",
         "",
-        "Status pembayaran dicek otomatis. Link VIP dikirim setelah pembayaran terdeteksi.",
+        f"Kode pesanan: <code>{public_invoice}</code>",
+        f"Paket VIP: <b>{format_rupiah(config.payment_amount)}</b>",
     ]
     if final_amount:
-        lines.insert(2, f"Nominal QRIS: {final_amount}")
-    if expires:
-        lines.insert(4, f"Batas bayar: {expires}")
+        lines.append(f"Nominal QRIS: <b>{html.escape(final_amount)}</b>")
+    if human_expires:
+        lines.append(f"⏳ Batas bayar: <b>{human_expires}</b>")
+    lines.extend(
+        [
+            "",
+            "📌 <b>Aturan pembayaran</b>",
+            "• Scan QRIS ini lalu bayar <b>1 kali saja</b>.",
+            "• QRIS ini <b>unik khusus pesanan kamu</b>.",
+            "• Status dicek otomatis, tidak perlu kirim bukti transfer.",
+            "",
+            "Setelah pembayaran terdeteksi, link VIP akan langsung dikirim otomatis.",
+        ]
+    )
     return "\n".join(lines)
 
 
@@ -345,28 +394,38 @@ async def send_qris(event, config, store):
         _session, buyer_name, buyer_email, order_id, payment_url, qris, qr_bytes = await asyncio.to_thread(
             create_qris_sync, config, user
         )
-        inv_id = qris.get("inv_id")
-        if not inv_id:
+        socia_invoice_id = qris.get("inv_id")
+        if not socia_invoice_id:
             raise SociaBuzzError(f"QRIS response missing inv_id: {qris}")
 
+        buyer_invoice_id = public_invoice_id()
+        qr_file = io.BytesIO(qr_bytes)
+        qr_file.name = f"{buyer_invoice_id}.png"
+        payload = qris.get("data", {})
+        qris_message = await event.client.send_file(
+            event.chat_id,
+            qr_file,
+            caption=qris_caption(
+                config,
+                buyer_invoice_id,
+                payload.get("amount") or "",
+                payload.get("countdown") or "",
+            ),
+            force_document=False,
+            parse_mode="html",
+        )
         store.create_payment(
             user,
+            buyer_invoice_id,
             order_id,
             payment_url,
-            inv_id,
+            socia_invoice_id,
             config.payment_amount,
             buyer_name,
             buyer_email,
             qris,
-        )
-        qr_file = io.BytesIO(qr_bytes)
-        qr_file.name = f"{inv_id}.png"
-        payload = qris.get("data", {})
-        await event.client.send_file(
             event.chat_id,
-            qr_file,
-            caption=qris_caption(config, inv_id, payload.get("amount") or "", payload.get("countdown") or ""),
-            force_document=False,
+            qris_message.id,
         )
         await status_msg.delete()
         await send_log(
@@ -376,7 +435,8 @@ async def send_qris(event, config, store):
             (
                 "<b>QRIS created</b>\n"
                 f"User: {html.escape(display_name(user))} (<code>{user.id}</code>)\n"
-                f"Invoice: <code>{html.escape(inv_id)}</code>\n"
+                f"Invoice: <code>{html.escape(buyer_invoice_id)}</code>\n"
+                f"Internal invoice: <code>{html.escape(socia_invoice_id)}</code>\n"
                 f"Order: <code>{html.escape(order_id)}</code>\n"
                 f"Amount: <code>{config.payment_amount}</code>"
             ),
@@ -393,13 +453,16 @@ async def process_paid_payment(client, config, store, payment):
     if not changed:
         return
 
+    await delete_qris_message(client, payment)
     await client.send_message(
         payment["user_id"],
         (
-            "Pembayaran terdeteksi.\n\n"
-            f"Link VIP:\n{invite_link}\n\n"
-            "Link ini hanya bisa dipakai 1 kali dan berlaku 24 jam."
+            "✅ <b>Pembayaran berhasil terdeteksi</b>\n\n"
+            "Akses VIP kamu sudah aktif. Pakai link di bawah ini untuk masuk:\n\n"
+            f"🔐 <b>Link VIP</b>\n{html.escape(invite_link)}\n\n"
+            "⚠️ Link ini hanya bisa dipakai <b>1 kali</b> dan berlaku <b>24 jam</b>."
         ),
+        parse_mode="html",
         link_preview=False,
     )
     await send_log(
@@ -409,10 +472,29 @@ async def process_paid_payment(client, config, store, payment):
         (
             "<b>Payment paid</b>\n"
             f"User: {user_link(payment)} (<code>{payment['user_id']}</code>)\n"
-            f"Invoice: <code>{html.escape(payment['inv_id'])}</code>\n"
+            f"Invoice: <code>{html.escape(payment.get('public_invoice_id') or payment['inv_id'])}</code>\n"
+            f"Internal invoice: <code>{html.escape(payment['inv_id'])}</code>\n"
+            f"Invite link: <code>{html.escape(invite_link)}</code>\n"
             f"Invite expires: <code>{html.escape(invite_expires_at)}</code>"
         ),
     )
+
+
+async def delete_qris_message(client, payment):
+    chat_id = payment.get("qris_chat_id")
+    message_id = payment.get("qris_message_id")
+    if not chat_id or not message_id:
+        return
+    try:
+        await client.delete_messages(int(chat_id), [int(message_id)], revoke=True)
+    except Exception as exc:
+        LOGGER.warning(
+            "Failed to delete QRIS message %s in chat %s for invoice %s: %s",
+            message_id,
+            chat_id,
+            payment.get("public_invoice_id") or payment.get("inv_id"),
+            exc,
+        )
 
 
 async def poll_once(client, config, store, payment):
@@ -513,8 +595,13 @@ async def main():
     @private_only
     async def start(event):
         await event.respond(
-            "Akses VIP tersedia dengan pembayaran QRIS.",
+            (
+                "🔥 <b>VIP Premium sudah siap</b>\n\n"
+                "Gabung sekarang dan akses konten/member area eksklusif. Pembayaran pakai QRIS, "
+                "dicek otomatis, dan link VIP dikirim langsung setelah berhasil."
+            ),
             buttons=[[Button.inline(f"Beli VIP - Rp{config.payment_amount:,}".replace(",", "."), b"buy_vip")]],
+            parse_mode="html",
         )
 
     @client.on(events.NewMessage(pattern=r"^/buy$"))
@@ -535,7 +622,11 @@ async def main():
     async def status(event):
         pending = store.latest_pending_for_user(event.sender_id)
         if pending:
-            await event.respond(f"Pembayaran masih dicek otomatis.\nInvoice: {pending['inv_id']}")
+            await event.respond(
+                "⏳ <b>Pembayaran masih dicek otomatis</b>\n"
+                f"Kode pesanan: <code>{html.escape(pending.get('public_invoice_id') or pending['inv_id'])}</code>",
+                parse_mode="html",
+            )
         else:
             await event.respond("Tidak ada pembayaran pending.")
 

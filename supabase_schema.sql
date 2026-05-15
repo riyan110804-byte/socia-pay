@@ -3,6 +3,7 @@ CREATE TABLE IF NOT EXISTS public.vip_payments (
     user_id BIGINT NOT NULL,
     username TEXT NOT NULL DEFAULT '',
     full_name TEXT NOT NULL DEFAULT '',
+    public_invoice_id TEXT NOT NULL,
     order_id TEXT NOT NULL UNIQUE,
     payment_url TEXT NOT NULL,
     inv_id TEXT NOT NULL UNIQUE,
@@ -12,6 +13,8 @@ CREATE TABLE IF NOT EXISTS public.vip_payments (
     buyer_email TEXT NOT NULL,
     qris_amount TEXT NOT NULL DEFAULT '',
     qris_expires TEXT NOT NULL DEFAULT '',
+    qris_chat_id BIGINT,
+    qris_message_id BIGINT,
     invite_link TEXT,
     invite_expires_at TIMESTAMPTZ,
     error TEXT NOT NULL DEFAULT '',
@@ -24,6 +27,18 @@ ON public.vip_payments (user_id, status, id DESC);
 
 CREATE INDEX IF NOT EXISTS idx_vip_payments_status_id
 ON public.vip_payments (status, id ASC);
+
+ALTER TABLE public.vip_payments
+ADD COLUMN IF NOT EXISTS public_invoice_id TEXT;
+
+ALTER TABLE public.vip_payments
+ADD COLUMN IF NOT EXISTS qris_chat_id BIGINT;
+
+ALTER TABLE public.vip_payments
+ADD COLUMN IF NOT EXISTS qris_message_id BIGINT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_vip_payments_public_invoice_id
+ON public.vip_payments (public_invoice_id);
 
 ALTER TABLE public.vip_payments ENABLE ROW LEVEL SECURITY;
 
