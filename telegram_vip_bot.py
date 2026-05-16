@@ -466,6 +466,10 @@ def package_log_line(package):
     )
 
 
+def is_active_payment_duplicate(exc):
+    return "idx_vip_payments_one_active_per_user" in str(exc)
+
+
 def format_qris_expiry(raw_expires):
     if not raw_expires:
         return ""
@@ -676,8 +680,17 @@ def package_buttons(config, store):
     return rows
 
 
-async def send_qris(event, config, store, qris_semaphore, package=None, invoice_message=None):
+async def send_qris(event, config, store, qris_semaphore, user_locks, package=None, invoice_message=None):
     user = await event.get_sender()
+    lock = user_locks.setdefault(user.id, asyncio.Lock())
+    if lock.locked():
+        await event.respond("QRIS kamu sedang dibuat. Tunggu beberapa detik, jangan klik berulang.")
+        return
+    async with lock:
+        await send_qris_locked(event, config, store, qris_semaphore, user, package, invoice_message)
+
+
+async def send_qris_locked(event, config, store, qris_semaphore, user, package=None, invoice_message=None):
     package = package or default_package(config, store)
     pending = store.latest_pending_for_user(user.id)
     if pending:
@@ -780,12 +793,33 @@ async def send_qris(event, config, store, qris_semaphore, package=None, invoice_
             await invoice_message.delete()
         except Exception:
             LOGGER.warning("Failed to delete invoice message after create error", exc_info=True)
+        if is_active_payment_duplicate(exc):
+            await event.respond("Masih ada pembayaran yang sedang dicek. Tunggu statusnya selesai dulu sebelum membuat QRIS baru.")
+            await send_log(
+                event.client,
+                config,
+                store,
+                (
+                    "<b>Duplicate active payment blocked</b>\n"
+                    f"User: {telegram_user_link(user)} (<code>{user.id}</code>)"
+                ),
+            )
+            return
         await event.respond("Gagal membuat QRIS. Coba lagi beberapa saat lagi.")
         await send_log(event.client, config, store, f"<b>QRIS error</b>\n<code>{html.escape(str(exc))}</code>")
 
 
-async def send_custom_qris(event, config, store, qris_semaphore, amount):
+async def send_custom_qris(event, config, store, qris_semaphore, user_locks, amount):
     user = await event.get_sender()
+    lock = user_locks.setdefault(user.id, asyncio.Lock())
+    if lock.locked():
+        await event.respond("Custom QRIS admin ini sedang dibuat. Tunggu beberapa detik.")
+        return
+    async with lock:
+        await send_custom_qris_locked(event, config, store, qris_semaphore, user, amount)
+
+
+async def send_custom_qris_locked(event, config, store, qris_semaphore, user, amount):
     pending = store.latest_pending_for_user(user.id)
     if pending:
         await event.respond(
@@ -860,6 +894,18 @@ async def send_custom_qris(event, config, store, qris_semaphore, amount):
             await invoice_message.delete()
         except Exception:
             LOGGER.warning("Failed to delete custom invoice message after create error", exc_info=True)
+        if is_active_payment_duplicate(exc):
+            await event.respond("Masih ada pembayaran yang sedang dicek untuk admin ini. Tunggu selesai dulu sebelum membuat custom QRIS baru.")
+            await send_log(
+                event.client,
+                config,
+                store,
+                (
+                    "<b>Duplicate custom active payment blocked</b>\n"
+                    f"User: {telegram_user_link(user)} (<code>{user.id}</code>)"
+                ),
+            )
+            return
         await event.respond("Gagal membuat custom QRIS. Coba lagi beberapa saat lagi.")
         await send_log(event.client, config, store, f"<b>Custom QRIS error</b>\n<code>{html.escape(str(exc))}</code>")
 
@@ -1161,6 +1207,7 @@ async def main():
     store = PaymentStore(config)
     client = TelegramClient("vip_bot", config.api_id, config.api_hash)
     qris_semaphore = asyncio.Semaphore(config.qris_create_concurrency)
+    user_locks = {}
 
     @client.on(events.NewMessage(pattern=r"^/start$"))
     @private_only
@@ -1179,7 +1226,7 @@ async def main():
             return
         await event.answer("Membuat QRIS...")
         invoice_message = await event.get_message()
-        await send_qris(event, config, store, qris_semaphore, invoice_message=invoice_message)
+        await send_qris(event, config, store, qris_semaphore, user_locks, invoice_message=invoice_message)
 
     @client.on(events.CallbackQuery(pattern=rb"^buy_pkg:(.+)$"))
     async def buy_package_callback(event):
@@ -1193,7 +1240,7 @@ async def main():
             return
         await event.answer("Membuat QRIS...")
         invoice_message = await event.get_message()
-        await send_qris(event, config, store, qris_semaphore, package=package, invoice_message=invoice_message)
+        await send_qris(event, config, store, qris_semaphore, user_locks, package=package, invoice_message=invoice_message)
 
     @client.on(events.NewMessage(pattern=r"^/status$"))
     @private_only
@@ -1235,7 +1282,7 @@ async def main():
         if amount > 10_000_000:
             await event.respond("Nominal custom maksimal Rp10.000.000.")
             return
-        await send_custom_qris(event, config, store, qris_semaphore, amount)
+        await send_custom_qris(event, config, store, qris_semaphore, user_locks, amount)
 
     @client.on(events.NewMessage(pattern=r"^/package_add(?:@\w+)?(?:\s+(.+))?$"))
     async def package_add(event):
