@@ -854,6 +854,7 @@ async def poll_once(client, config, store, payment):
             changed = store.mark_status_if_current(payment["inv_id"], "pending", status)
             if not changed:
                 return
+            log_status = "expired" if status == "unknown" else status
             await delete_qris_message(client, payment)
             await safe_send_user(
                 client,
@@ -869,7 +870,7 @@ async def poll_once(client, config, store, payment):
                 config,
                 store,
                 (
-                    f"<b>Payment {html.escape(status)}</b>\n"
+                    f"<b>Payment {html.escape(log_status)}</b>\n"
                     f"User: {user_link(payment)} (<code>{payment['user_id']}</code>)\n"
                     f"Invoice: <code>{html.escape(payment['inv_id'])}</code>\n"
                     f"Check: {html.escape(status_url)}"
