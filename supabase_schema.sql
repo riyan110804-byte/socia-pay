@@ -3,6 +3,11 @@ CREATE TABLE IF NOT EXISTS public.vip_payments (
     user_id BIGINT NOT NULL,
     username TEXT NOT NULL DEFAULT '',
     full_name TEXT NOT NULL DEFAULT '',
+    package_code TEXT NOT NULL DEFAULT '',
+    package_name TEXT NOT NULL DEFAULT '',
+    package_amount INTEGER NOT NULL DEFAULT 0,
+    vip_chat_id BIGINT,
+    invite_expire_hours INTEGER NOT NULL DEFAULT 0,
     public_invoice_id TEXT NOT NULL,
     order_id TEXT NOT NULL UNIQUE,
     payment_url TEXT NOT NULL,
@@ -45,10 +50,28 @@ ALTER TABLE public.vip_payments
 ADD COLUMN IF NOT EXISTS public_invoice_id TEXT;
 
 ALTER TABLE public.vip_payments
+ADD COLUMN IF NOT EXISTS package_code TEXT NOT NULL DEFAULT '';
+
+ALTER TABLE public.vip_payments
+ADD COLUMN IF NOT EXISTS package_name TEXT NOT NULL DEFAULT '';
+
+ALTER TABLE public.vip_payments
+ADD COLUMN IF NOT EXISTS package_amount INTEGER NOT NULL DEFAULT 0;
+
+ALTER TABLE public.vip_payments
+ADD COLUMN IF NOT EXISTS vip_chat_id BIGINT;
+
+ALTER TABLE public.vip_payments
+ADD COLUMN IF NOT EXISTS invite_expire_hours INTEGER NOT NULL DEFAULT 0;
+
+ALTER TABLE public.vip_payments
 ADD COLUMN IF NOT EXISTS qris_chat_id BIGINT;
 
 ALTER TABLE public.vip_payments
 ADD COLUMN IF NOT EXISTS qris_message_id BIGINT;
+
+CREATE INDEX IF NOT EXISTS idx_vip_payments_package_code
+ON public.vip_payments (package_code);
 
 ALTER TABLE public.vip_payments
 DROP CONSTRAINT IF EXISTS vip_payments_status_check;
@@ -124,3 +147,29 @@ ALTER TABLE public.vip_bot_settings ENABLE ROW LEVEL SECURITY;
 
 REVOKE ALL ON public.vip_bot_settings FROM anon, authenticated;
 GRANT SELECT, INSERT, UPDATE ON public.vip_bot_settings TO service_role;
+
+CREATE TABLE IF NOT EXISTS public.vip_packages (
+    code TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    vip_chat_id BIGINT NOT NULL,
+    amount INTEGER NOT NULL CHECK (amount >= 1000 AND amount <= 10000000),
+    invite_expire_hours INTEGER NOT NULL DEFAULT 0,
+    active BOOLEAN NOT NULL DEFAULT true,
+    sort_order INTEGER NOT NULL DEFAULT 100,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+ALTER TABLE public.vip_packages
+ADD COLUMN IF NOT EXISTS invite_expire_hours INTEGER NOT NULL DEFAULT 0;
+
+ALTER TABLE public.vip_packages
+ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT true;
+
+ALTER TABLE public.vip_packages
+ADD COLUMN IF NOT EXISTS sort_order INTEGER NOT NULL DEFAULT 100;
+
+ALTER TABLE public.vip_packages ENABLE ROW LEVEL SECURITY;
+
+REVOKE ALL ON public.vip_packages FROM anon, authenticated;
+GRANT SELECT, INSERT, UPDATE ON public.vip_packages TO service_role;

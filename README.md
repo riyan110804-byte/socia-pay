@@ -14,13 +14,13 @@ Isi `.env`:
 
 - `TELEGRAM_API_ID` dan `TELEGRAM_API_HASH` dari https://my.telegram.org
 - `TELEGRAM_BOT_TOKEN` dari BotFather
-- `VIP_CHAT_ID` group/channel VIP tujuan invite
+- `VIP_CHAT_ID` optional fallback group/channel VIP tujuan invite
 - `LOG_CHAT_ID` group/channel untuk log transaksi
 - `SUPABASE_URL` dan `SUPABASE_SERVICE_ROLE_KEY` dari Supabase Project Settings
 - `ADMIN_USER_IDS` Telegram user ID admin yang boleh ubah config bot
 - `SOCIABUZZ_USERNAME` username SociaBuzz target TRIBE
 
-Bot harus menjadi admin di `VIP_CHAT_ID` dengan permission invite users.
+Bot harus menjadi admin di semua group VIP tujuan invite dengan permission invite users.
 
 Jalankan SQL di `supabase_schema.sql` lewat Supabase SQL Editor sebelum bot dijalankan.
 
@@ -37,6 +37,17 @@ Jalankan SQL di `supabase_schema.sql` lewat Supabase SQL Editor sebelum bot dija
 
 Command `/setvip`, `/setlog`, dan `/config` hanya bisa dipakai Telegram user ID yang masuk `ADMIN_USER_IDS`.
 
+Untuk banyak group dengan harga berbeda, buat paket dari group/channel logging:
+
+```text
+/package_add a group a|-1001234567890|5000
+/package_add b group b|-1009876543210|2000
+/package_list
+/package_delete a
+```
+
+Tombol user akan tampil seperti `group a - 5.000`. Command paket hanya bisa dipakai admin. `/package_add` dan `/package_delete` hanya diproses di `LOG_CHAT_ID` supaya perubahan paket tercatat rapi.
+
 Admin juga bisa membuat QRIS nominal bebas dari group/channel logging:
 
 ```text
@@ -51,9 +62,9 @@ Command `/custom` hanya diproses kalau dikirim oleh admin di `LOG_CHAT_ID`. QRIS
 python telegram_vip_bot.py
 ```
 
-User DM bot lalu `/start`, klik tombol `Beli VIP - Rp2.000`, message tombol akan berubah menjadi invoice QRIS. Nominal checkout mengikuti `PAYMENT_AMOUNT`. Setelah pembayaran terdeteksi, bot menghapus QRIS dan mengirim invite link VIP. Kalau pembayaran gagal/expired/tidak valid, bot juga menghapus QRIS supaya tidak terscan lagi. Invite link berlaku 24 jam dan hanya bisa dipakai 1 kali. Log transaksi menyimpan kode pesanan internal, kode pesanan user, nominal checkout, nominal QRIS, dan invite link yang dikirim.
+User DM bot lalu `/start`, pilih paket seperti `group a - 5.000`, message tombol akan berubah menjadi invoice QRIS. Nominal checkout mengikuti paket yang dipilih. Setelah pembayaran terdeteksi, bot menghapus QRIS dan mengirim invite link ke group paket tersebut. Kalau pembayaran gagal/expired/tidak valid, bot juga menghapus QRIS supaya tidak terscan lagi. Invite link berlaku sesuai `INVITE_EXPIRE_HOURS` dan hanya bisa dipakai 1 kali. Log transaksi menyimpan paket, kode pesanan internal, kode pesanan user, nominal checkout, nominal QRIS, dan invite link yang dikirim.
 
-Kalau database sudah pernah dibuat sebelum versi ini, jalankan ulang isi `supabase_schema.sql` di SQL Editor supaya kolom `public_invoice_id`, `qris_chat_id`, `qris_message_id`, dan status recovery production ikut aktif.
+Kalau database sudah pernah dibuat sebelum versi ini, jalankan ulang isi `supabase_schema.sql` di SQL Editor supaya tabel `vip_packages`, kolom paket payment, dan status recovery production ikut aktif.
 
 Bot membatasi pembuatan QRIS bersamaan lewat `QRIS_CREATE_CONCURRENCY` supaya traffic ramai tetap antre rapi. Default `5` cukup aman untuk awal; naikkan pelan-pelan kalau SociaBuzz tetap stabil.
 
@@ -76,11 +87,12 @@ Set variables ini di Railway:
 - `SUPABASE_SERVICE_ROLE_KEY`
 - `SUPABASE_TABLE=vip_payments`
 - `SUPABASE_SETTINGS_TABLE=vip_bot_settings`
+- `SUPABASE_PACKAGE_TABLE=vip_packages`
 - `SUPABASE_QUERY_RETRIES=3`
 - `SUPABASE_RETRY_BASE_DELAY=0.35`
 - `ADMIN_USER_IDS`
 - `SOCIABUZZ_USERNAME`
-- `PAYMENT_AMOUNT=2000` sebagai nominal checkout paket VIP.
+- `PAYMENT_AMOUNT=2000` sebagai fallback kalau belum ada paket aktif.
 - `INVITE_EXPIRE_HOURS=24`
 - `POLL_INTERVAL_SECONDS=3`
 - `POLL_MAX_ATTEMPTS=300`

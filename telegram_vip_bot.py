@@ -93,6 +93,7 @@ class Config:
     supabase_url: str
     supabase_service_role_key: str
     supabase_table: str
+    supabase_package_table: str
 
 
 def env_required(name):
@@ -143,12 +144,14 @@ def load_config():
         supabase_url=env_required("SUPABASE_URL"),
         supabase_service_role_key=env_required("SUPABASE_SERVICE_ROLE_KEY"),
         supabase_table=os.getenv("SUPABASE_TABLE", "vip_payments").strip() or "vip_payments",
+        supabase_package_table=os.getenv("SUPABASE_PACKAGE_TABLE", "vip_packages").strip() or "vip_packages",
     )
 
 
 class PaymentStore:
     def __init__(self, config):
         self.table = config.supabase_table
+        self.package_table = config.supabase_package_table
         self.settings_table = os.getenv("SUPABASE_SETTINGS_TABLE", "vip_bot_settings").strip() or "vip_bot_settings"
         self.client = create_client(config.supabase_url, config.supabase_service_role_key)
         self.query_retries = max(1, env_int("SUPABASE_QUERY_RETRIES", 3))
@@ -185,13 +188,20 @@ class PaymentStore:
         qris_data,
         qris_chat_id,
         qris_message_id,
+        package=None,
     ):
         now = utc_now_iso()
         payload = qris_data.get("data", {})
+        package = package or {}
         data = {
             "user_id": user.id,
             "username": user.username or "",
             "full_name": display_name(user),
+            "package_code": package.get("code") or "",
+            "package_name": package.get("name") or "",
+            "package_amount": int(package.get("amount") or amount),
+            "vip_chat_id": package.get("vip_chat_id"),
+            "invite_expire_hours": int(package.get("invite_expire_hours") or 0),
             "public_invoice_id": public_invoice_id,
             "order_id": order_id,
             "payment_url": payment_url,
@@ -208,6 +218,40 @@ class PaymentStore:
             "updated_at": now,
         }
         self._execute(self.client.table(self.table).insert(data), "create payment")
+
+    def list_packages(self, include_inactive=False):
+        query = self.client.table(self.package_table).select("*")
+        if not include_inactive:
+            query = query.eq("active", True)
+        query = query.order("sort_order", desc=False).order("code", desc=False)
+        response = self._execute(query, "list packages")
+        return response.data or []
+
+    def get_package(self, code):
+        query = self.client.table(self.package_table).select("*").eq("code", normalize_package_code(code)).eq("active", True).limit(1)
+        response = self._execute(query, "get package")
+        return response.data[0] if response.data else None
+
+    def upsert_package(self, code, name, vip_chat_id, amount, invite_expire_hours=0):
+        now = utc_now_iso()
+        data = {
+            "code": normalize_package_code(code),
+            "name": name.strip(),
+            "vip_chat_id": int(vip_chat_id),
+            "amount": int(amount),
+            "invite_expire_hours": int(invite_expire_hours or 0),
+            "active": True,
+            "updated_at": now,
+        }
+        query = self.client.table(self.package_table).upsert(data, on_conflict="code")
+        self._execute(query, "upsert package")
+
+    def delete_package(self, code):
+        query = self.client.table(self.package_table).update(
+            {"active": False, "updated_at": utc_now_iso()}
+        ).eq("code", normalize_package_code(code))
+        response = self._execute(query, "delete package")
+        return bool(response.data)
 
     def latest_pending_for_user(self, user_id):
         rows = []
@@ -376,6 +420,47 @@ def format_rupiah(amount):
     return f"Rp{amount:,}".replace(",", ".")
 
 
+def format_button_amount(amount):
+    return f"{int(amount):,}".replace(",", ".")
+
+
+def normalize_package_code(code):
+    normalized = (code or "").strip().lower()
+    if not normalized:
+        raise ValueError("Kode paket wajib diisi.")
+    if len(normalized) > 32:
+        raise ValueError("Kode paket maksimal 32 karakter.")
+    allowed = set(string.ascii_lowercase + string.digits + "_-")
+    if any(ch not in allowed for ch in normalized):
+        raise ValueError("Kode paket hanya boleh huruf, angka, underscore, dan strip.")
+    return normalized
+
+
+def default_package(config, store):
+    vip_chat_id = runtime_vip_chat_id(config, store)
+    return {
+        "code": "default",
+        "name": "VIP",
+        "amount": config.payment_amount,
+        "vip_chat_id": vip_chat_id,
+        "invite_expire_hours": config.invite_expire_hours,
+    }
+
+
+def package_label(package):
+    return f"{package['name']} - {format_button_amount(package['amount'])}"
+
+
+def package_log_line(package):
+    if not package:
+        return "Package: <code>custom</code>"
+    return (
+        f"Package: <code>{html.escape(package.get('code') or '')}</code> "
+        f"{html.escape(package.get('name') or '')} "
+        f"(<code>{package.get('vip_chat_id') or ''}</code>)"
+    )
+
+
 def format_qris_expiry(raw_expires):
     if not raw_expires:
         return ""
@@ -474,29 +559,32 @@ def check_payment_sync(config, inv_id):
 
 
 async def create_invite_link(client, config, store, payment):
-    vip_chat_id = runtime_vip_chat_id(config, store)
+    vip_chat_id = int(payment.get("vip_chat_id") or 0) or runtime_vip_chat_id(config, store)
     if not vip_chat_id:
-        raise RuntimeError("VIP chat belum di-set. Admin perlu pakai /setvip <chat_id>.")
-    expires_at = dt.datetime.now(dt.UTC) + dt.timedelta(hours=config.invite_expire_hours)
+        raise RuntimeError("VIP chat belum di-set. Admin perlu set paket atau pakai /setvip <chat_id>.")
+    invite_hours = int(payment.get("invite_expire_hours") or 0) or config.invite_expire_hours
+    expires_at = dt.datetime.now(dt.UTC) + dt.timedelta(hours=invite_hours)
+    title_name = payment.get("package_name") or "VIP"
     result = await client(
         functions.messages.ExportChatInviteRequest(
             peer=vip_chat_id,
             expire_date=expires_at,
             usage_limit=1,
-            title=f"VIP {payment['inv_id']}",
+            title=f"{title_name} {payment['inv_id']}",
         )
     )
     return result.link, expires_at.replace(microsecond=0).isoformat()
 
 
-def qris_caption(config, inv_id, checkout_amount, final_amount, expires):
+def qris_caption(package, inv_id, checkout_amount, final_amount, expires):
     public_invoice = html.escape(inv_id)
     human_expires = html.escape(format_qris_expiry(expires))
     lines = [
         "🔥 <b>Akses VIP Premium</b>",
         "",
         f"Kode pesanan: <code>{public_invoice}</code>",
-        f"Paket VIP: <b>{format_rupiah(checkout_amount)}</b>",
+        f"Paket: <b>{html.escape(package['name'])}</b>",
+        f"Nominal paket: <b>{format_rupiah(checkout_amount)}</b>",
     ]
     if final_amount:
         lines.append(f"Nominal QRIS: <b>{html.escape(final_amount)}</b>")
@@ -543,12 +631,12 @@ def custom_qris_caption(inv_id, checkout_amount, final_amount, expires, user):
     return "\n".join(lines)
 
 
-def paid_message(invite_link):
+def paid_message(invite_link, package_name="VIP", invite_hours=24):
     return (
         "✅ <b>Pembayaran berhasil terdeteksi</b>\n\n"
-        "Akses VIP kamu sudah aktif. Pakai link di bawah ini untuk masuk:\n\n"
+        f"Akses <b>{html.escape(package_name)}</b> kamu sudah aktif. Pakai link di bawah ini untuk masuk:\n\n"
         f"🔐 <b>Link VIP</b>\n{html.escape(invite_link)}\n\n"
-        "⚠️ Link ini hanya bisa dipakai <b>1 kali</b> dan berlaku <b>24 jam</b>."
+        f"⚠️ Link ini hanya bisa dipakai <b>1 kali</b> dan berlaku <b>{int(invite_hours)} jam</b>."
     )
 
 
@@ -568,12 +656,24 @@ def timeout_payment_message():
     )
 
 
-def buy_buttons(config):
-    return [[Button.inline(f"Buat QRIS Baru - {format_rupiah(config.payment_amount)}", b"buy_vip")]]
+def package_buttons(config, store):
+    try:
+        packages = store.list_packages()
+    except Exception as exc:
+        LOGGER.warning("Failed to load package buttons, using default package: %s", exc)
+        packages = []
+    if not packages:
+        return [[Button.inline(package_label(default_package(config, store)), b"buy_vip")]]
+    rows = []
+    for package in packages:
+        data = f"buy_pkg:{normalize_package_code(package['code'])}".encode()
+        rows.append([Button.inline(package_label(package), data)])
+    return rows
 
 
-async def send_qris(event, config, store, qris_semaphore, invoice_message=None):
+async def send_qris(event, config, store, qris_semaphore, package=None, invoice_message=None):
     user = await event.get_sender()
+    package = package or default_package(config, store)
     pending = store.latest_pending_for_user(user.id)
     if pending:
         await event.respond(
@@ -596,7 +696,7 @@ async def send_qris(event, config, store, qris_semaphore, invoice_message=None):
                 qris,
                 qr_bytes,
                 checkout_amount,
-            ) = await asyncio.to_thread(create_qris_sync, config, user)
+            ) = await asyncio.to_thread(create_qris_sync, config, user, int(package["amount"]), package["code"].upper())
         socia_invoice_id = qris.get("inv_id")
         if not socia_invoice_id:
             raise SociaBuzzError(f"QRIS response missing inv_id: {qris}")
@@ -609,7 +709,7 @@ async def send_qris(event, config, store, qris_semaphore, invoice_message=None):
             event.chat_id,
             invoice_message.id,
             qris_caption(
-                config,
+                package,
                 buyer_invoice_id,
                 checkout_amount,
                 payload.get("amount") or "",
@@ -630,6 +730,7 @@ async def send_qris(event, config, store, qris_semaphore, invoice_message=None):
             qris,
             event.chat_id,
             invoice_message.id,
+            package=package,
         )
         await send_log(
             event.client,
@@ -638,6 +739,7 @@ async def send_qris(event, config, store, qris_semaphore, invoice_message=None):
             (
                 "<b>QRIS created</b>\n"
                 f"User: {telegram_user_link(user)} (<code>{user.id}</code>)\n"
+                f"{package_log_line(package)}\n"
                 f"Invoice: <code>{html.escape(buyer_invoice_id)}</code>\n"
                 f"Internal invoice: <code>{html.escape(socia_invoice_id)}</code>\n"
                 f"Source payment: <code>{html.escape(qris.get('source_payment') or '')}</code>\n"
@@ -784,7 +886,11 @@ async def process_paid_payment(client, config, store, payment):
         config,
         store,
         payment["user_id"],
-        paid_message(invite_link),
+        paid_message(
+            invite_link,
+            payment.get("package_name") or "VIP",
+            int(payment.get("invite_expire_hours") or 0) or config.invite_expire_hours,
+        ),
         parse_mode="html",
         link_preview=False,
     )
@@ -803,6 +909,7 @@ async def process_paid_payment(client, config, store, payment):
         (
             "<b>Payment paid</b>\n"
             f"User: {user_link(payment)} (<code>{payment['user_id']}</code>)\n"
+            f"Package: <code>{html.escape(payment.get('package_code') or '')}</code> {html.escape(payment.get('package_name') or '')}\n"
             f"Invoice: <code>{html.escape(payment.get('public_invoice_id') or payment['inv_id'])}</code>\n"
             f"Internal invoice: <code>{html.escape(payment['inv_id'])}</code>\n"
             f"Invite link: <code>{html.escape(invite_link)}</code>\n"
@@ -851,7 +958,7 @@ async def poll_once(client, config, store, payment):
                 payment["user_id"],
                 invalid_payment_message(),
                 parse_mode="html",
-                buttons=buy_buttons(config),
+                buttons=package_buttons(config, store),
             )
             await send_log(
                 client,
@@ -860,7 +967,9 @@ async def poll_once(client, config, store, payment):
                 (
                     f"<b>Payment {html.escape(log_status)}</b>\n"
                     f"User: {user_link(payment)} (<code>{payment['user_id']}</code>)\n"
-                    f"Invoice: <code>{html.escape(payment['inv_id'])}</code>\n"
+                    f"Invoice: <code>{html.escape(payment.get('public_invoice_id') or payment['inv_id'])}</code>\n"
+                    f"Internal invoice: <code>{html.escape(payment['inv_id'])}</code>\n"
+                    f"Package: <code>{html.escape(payment.get('package_code') or '')}</code> {html.escape(payment.get('package_name') or '')}\n"
                     f"Check: {html.escape(status_url)}"
                 ),
             )
@@ -900,7 +1009,7 @@ async def polling_loop(client, config, store):
                             payment["user_id"],
                             timeout_payment_message(),
                             parse_mode="html",
-                            buttons=buy_buttons(config),
+                            buttons=package_buttons(config, store),
                         )
                         await send_log(
                             client,
@@ -909,6 +1018,7 @@ async def polling_loop(client, config, store):
                             (
                                 "<b>Payment timeout</b>\n"
                                 f"User: {user_link(payment)} (<code>{payment['user_id']}</code>)\n"
+                                f"Package: <code>{html.escape(payment.get('package_code') or '')}</code> {html.escape(payment.get('package_name') or '')}\n"
                                 f"Invoice: <code>{html.escape(payment.get('public_invoice_id') or payment['inv_id'])}</code>\n"
                                 f"Internal invoice: <code>{html.escape(payment['inv_id'])}</code>"
                             ),
@@ -972,6 +1082,54 @@ async def require_log_chat(event, config, store):
     return False
 
 
+async def send_package_menu(event, config, store, text=None):
+    await event.respond(
+        text
+        or (
+            "🔥 <b>VIP Premium sudah siap</b>\n\n"
+            "Pilih group VIP yang mau kamu akses. Pembayaran pakai QRIS, dicek otomatis, "
+            "dan link VIP dikirim langsung setelah berhasil."
+        ),
+        buttons=package_buttons(config, store),
+        parse_mode="html",
+    )
+
+
+def parse_package_add_args(raw):
+    raw = (raw or "").strip()
+    if not raw or " " not in raw:
+        raise ValueError("Format: /package_add kode Nama Group|-1001234567890|5000")
+    code, rest = raw.split(None, 1)
+    parts = [part.strip() for part in rest.split("|")]
+    if len(parts) != 3:
+        raise ValueError("Format: /package_add kode Nama Group|-1001234567890|5000")
+    name, chat_id, amount = parts
+    if not name:
+        raise ValueError("Nama paket wajib diisi.")
+    digits = "".join(ch for ch in amount if ch.isdigit())
+    if not digits:
+        raise ValueError("Nominal paket harus angka.")
+    amount_value = int(digits)
+    if amount_value < 1000:
+        raise ValueError("Nominal paket minimal Rp1.000.")
+    if amount_value > 10_000_000:
+        raise ValueError("Nominal paket maksimal Rp10.000.000.")
+    return normalize_package_code(code), name, int(chat_id), amount_value
+
+
+def package_list_text(packages):
+    if not packages:
+        return "Belum ada paket aktif. Tambah dengan `/package_add kode Nama Group|-1001234567890|5000`."
+    lines = ["<b>Paket aktif</b>"]
+    for package in packages:
+        lines.append(
+            f"- <code>{html.escape(package['code'])}</code> "
+            f"{html.escape(package['name'])} - <b>{format_button_amount(package['amount'])}</b> "
+            f"chat <code>{package['vip_chat_id']}</code>"
+        )
+    return "\n".join(lines)
+
+
 async def main():
     config = load_config()
     store = PaymentStore(config)
@@ -981,20 +1139,12 @@ async def main():
     @client.on(events.NewMessage(pattern=r"^/start$"))
     @private_only
     async def start(event):
-        await event.respond(
-            (
-                "🔥 <b>VIP Premium sudah siap</b>\n\n"
-                "Gabung sekarang dan akses konten/member area eksklusif. Pembayaran pakai QRIS, "
-                "dicek otomatis, dan link VIP dikirim langsung setelah berhasil."
-            ),
-            buttons=[[Button.inline(f"Beli VIP - Rp{config.payment_amount:,}".replace(",", "."), b"buy_vip")]],
-            parse_mode="html",
-        )
+        await send_package_menu(event, config, store)
 
     @client.on(events.NewMessage(pattern=r"^/buy$"))
     @private_only
     async def buy_command(event):
-        await send_qris(event, config, store, qris_semaphore)
+        await send_package_menu(event, config, store)
 
     @client.on(events.CallbackQuery(data=b"buy_vip"))
     async def buy_callback(event):
@@ -1004,6 +1154,20 @@ async def main():
         await event.answer("Membuat QRIS...")
         invoice_message = await event.get_message()
         await send_qris(event, config, store, qris_semaphore, invoice_message=invoice_message)
+
+    @client.on(events.CallbackQuery(pattern=rb"^buy_pkg:(.+)$"))
+    async def buy_package_callback(event):
+        if not event.is_private:
+            await event.answer("Buka bot lewat private chat.", alert=True)
+            return
+        code = event.pattern_match.group(1).decode()
+        package = store.get_package(code)
+        if not package:
+            await event.answer("Paket sudah tidak aktif. Ketik /start lagi.", alert=True)
+            return
+        await event.answer("Membuat QRIS...")
+        invoice_message = await event.get_message()
+        await send_qris(event, config, store, qris_semaphore, package=package, invoice_message=invoice_message)
 
     @client.on(events.NewMessage(pattern=r"^/status$"))
     @private_only
@@ -1046,6 +1210,68 @@ async def main():
             await event.respond("Nominal custom maksimal Rp10.000.000.")
             return
         await send_custom_qris(event, config, store, qris_semaphore, amount)
+
+    @client.on(events.NewMessage(pattern=r"^/package_add(?:@\w+)?(?:\s+(.+))?$"))
+    async def package_add(event):
+        if not await require_admin(event, config, store):
+            return
+        if not await require_log_chat(event, config, store):
+            return
+        try:
+            code, name, vip_chat_id, amount = parse_package_add_args(event.pattern_match.group(1) or "")
+            store.upsert_package(code, name, vip_chat_id, amount, config.invite_expire_hours)
+            await event.respond(
+                f"Paket aktif: <code>{html.escape(code)}</code> {html.escape(name)} - <b>{format_button_amount(amount)}</b>",
+                parse_mode="html",
+            )
+            await send_log(
+                client,
+                config,
+                store,
+                (
+                    "<b>Package updated</b>\n"
+                    f"Code: <code>{html.escape(code)}</code>\n"
+                    f"Name: <code>{html.escape(name)}</code>\n"
+                    f"VIP chat: <code>{vip_chat_id}</code>\n"
+                    f"Amount: <code>{amount}</code>\n"
+                    f"Admin: <code>{event.sender_id}</code>"
+                ),
+            )
+        except Exception as exc:
+            await event.respond(f"Gagal tambah paket: <code>{html.escape(str(exc))}</code>", parse_mode="html")
+
+    @client.on(events.NewMessage(pattern=r"^/package_list(?:@\w+)?$"))
+    async def package_list(event):
+        if not await require_admin(event, config, store):
+            return
+        packages = store.list_packages()
+        await event.respond(package_list_text(packages), parse_mode="html")
+
+    @client.on(events.NewMessage(pattern=r"^/package_delete(?:@\w+)?(?:\s+(.+))?$"))
+    async def package_delete(event):
+        if not await require_admin(event, config, store):
+            return
+        if not await require_log_chat(event, config, store):
+            return
+        code = (event.pattern_match.group(1) or "").strip()
+        if not code:
+            await event.respond("Format: `/package_delete kode`")
+            return
+        try:
+            normalized = normalize_package_code(code)
+            changed = store.delete_package(normalized)
+            if changed:
+                await event.respond(f"Paket <code>{html.escape(normalized)}</code> dinonaktifkan.", parse_mode="html")
+                await send_log(
+                    client,
+                    config,
+                    store,
+                    f"<b>Package disabled</b>\nCode: <code>{html.escape(normalized)}</code>\nAdmin: <code>{event.sender_id}</code>",
+                )
+            else:
+                await event.respond("Paket tidak ditemukan atau sudah nonaktif.")
+        except Exception as exc:
+            await event.respond(f"Gagal hapus paket: <code>{html.escape(str(exc))}</code>", parse_mode="html")
 
     @client.on(events.NewMessage(pattern=r"^/setvip(?:\s+(.+))?$"))
     async def set_vip(event):
@@ -1090,6 +1316,7 @@ async def main():
             f"VIP_CHAT_ID: `{vip_chat_id or 'belum diset'}`\n"
             f"LOG_CHAT_ID: `{log_chat_id or 'belum diset'}`\n"
             f"PAYMENT_AMOUNT: `{config.payment_amount}`\n"
+            f"SUPABASE_PACKAGE_TABLE: `{config.supabase_package_table}`\n"
             f"INVITE_EXPIRE_HOURS: `{config.invite_expire_hours}`"
         )
 
