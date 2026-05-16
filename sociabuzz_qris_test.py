@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 import argparse
+import os
 import sys
 
 try:
     from sociabuzz_client import (
-        DEFAULT_USERNAME,
         SociaBuzzError,
         create_donation_order,
         create_qris,
@@ -21,7 +21,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Test SociaBuzz TRIBE internal QRIS creation flow."
     )
-    parser.add_argument("--username", default=DEFAULT_USERNAME)
+    parser.add_argument("--username", default=os.getenv("SOCIABUZZ_USERNAME", ""))
     parser.add_argument("--amount", default="1000", help="Donation amount in IDR, e.g. 1000")
     parser.add_argument(
         "--source-payment",
@@ -61,6 +61,9 @@ def log(message):
 
 def main():
     args = parse_args()
+    if not args.username.strip():
+        print("ERROR: set SOCIABUZZ_USERNAME or pass --username <sociabuzz_username>.", file=sys.stderr)
+        return 1
     session = new_session(args.cookie)
 
     try:

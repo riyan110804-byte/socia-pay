@@ -9,7 +9,6 @@ import requests
 
 
 BASE_URL = "https://sociabuzz.com"
-DEFAULT_USERNAME = "yudhaprihardana"
 
 
 class SociaBuzzError(RuntimeError):

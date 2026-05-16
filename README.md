@@ -18,7 +18,7 @@ Isi `.env`:
 - `LOG_CHAT_ID` group/channel untuk log transaksi
 - `SUPABASE_URL` dan `SUPABASE_SERVICE_ROLE_KEY` dari Supabase Project Settings
 - `ADMIN_USER_IDS` Telegram user ID admin yang boleh ubah config bot
-- `SOCIABUZZ_USERNAME=yudhaprihardana`
+- `SOCIABUZZ_USERNAME` username SociaBuzz target TRIBE
 
 Bot harus menjadi admin di `VIP_CHAT_ID` dengan permission invite users.
 
@@ -51,7 +51,7 @@ Command `/custom` hanya diproses kalau dikirim oleh admin di `LOG_CHAT_ID`. QRIS
 python telegram_vip_bot.py
 ```
 
-User DM bot lalu `/start`, klik tombol `Beli VIP - Rp2.000`, message tombol akan berubah menjadi invoice QRIS. Setiap invoice memakai kode unik 3 digit di atas harga paket, jadi nominal checkout tidak terus-terusan sama. Setelah pembayaran terdeteksi, bot menghapus QRIS dan mengirim invite link VIP. Kalau pembayaran gagal/expired/tidak valid, bot juga menghapus QRIS supaya tidak terscan lagi. Invite link berlaku 24 jam dan hanya bisa dipakai 1 kali. Log transaksi menyimpan kode pesanan internal, kode pesanan user, total checkout, nominal QRIS, dan invite link yang dikirim.
+User DM bot lalu `/start`, klik tombol `Beli VIP - Rp2.000`, message tombol akan berubah menjadi invoice QRIS. Nominal checkout mengikuti `PAYMENT_AMOUNT`. Setelah pembayaran terdeteksi, bot menghapus QRIS dan mengirim invite link VIP. Kalau pembayaran gagal/expired/tidak valid, bot juga menghapus QRIS supaya tidak terscan lagi. Invite link berlaku 24 jam dan hanya bisa dipakai 1 kali. Log transaksi menyimpan kode pesanan internal, kode pesanan user, nominal checkout, nominal QRIS, dan invite link yang dikirim.
 
 Kalau database sudah pernah dibuat sebelum versi ini, jalankan ulang isi `supabase_schema.sql` di SQL Editor supaya kolom `public_invoice_id`, `qris_chat_id`, `qris_message_id`, dan status recovery production ikut aktif.
 
@@ -80,7 +80,7 @@ Set variables ini di Railway:
 - `SUPABASE_RETRY_BASE_DELAY=0.35`
 - `ADMIN_USER_IDS`
 - `SOCIABUZZ_USERNAME`
-- `PAYMENT_AMOUNT=2000` sebagai harga dasar paket. Bot otomatis menambah kode unik 3 digit untuk total checkout.
+- `PAYMENT_AMOUNT=2000` sebagai nominal checkout paket VIP.
 - `INVITE_EXPIRE_HOURS=24`
 - `POLL_INTERVAL_SECONDS=3`
 - `POLL_MAX_ATTEMPTS=300`

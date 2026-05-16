@@ -132,7 +132,7 @@ def load_config():
         bot_token=env_required("TELEGRAM_BOT_TOKEN"),
         vip_chat_id=env_optional_int("VIP_CHAT_ID"),
         log_chat_id=env_optional_int("LOG_CHAT_ID"),
-        sociabuzz_username=os.getenv("SOCIABUZZ_USERNAME", "yudhaprihardana").strip(),
+        sociabuzz_username=env_required("SOCIABUZZ_USERNAME"),
         sociabuzz_cookie=os.getenv("SOCIABUZZ_COOKIE", "").strip(),
         payment_amount=env_int("PAYMENT_AMOUNT", 2000),
         invite_expire_hours=env_int("INVITE_EXPIRE_HOURS", 24),
@@ -376,10 +376,6 @@ def format_rupiah(amount):
     return f"Rp{amount:,}".replace(",", ".")
 
 
-def unique_payment_code():
-    return secrets.randbelow(900) + 100
-
-
 def format_qris_expiry(raw_expires):
     if not raw_expires:
         return ""
@@ -445,12 +441,10 @@ async def safe_send_user(client, config, store, user_id, text, **kwargs):
         return False
 
 
-def create_qris_sync(config, user, amount=None, use_unique_code=True, note_prefix="VIP"):
+def create_qris_sync(config, user, amount=None, note_prefix="VIP"):
     session = new_session(config.sociabuzz_cookie)
     buyer_name, buyer_email = random_indonesian_identity()
-    base_amount = amount if amount is not None else config.payment_amount
-    unique_code = unique_payment_code() if use_unique_code else 0
-    checkout_amount = base_amount + unique_code
+    checkout_amount = amount if amount is not None else config.payment_amount
     note = f"{note_prefix} {user.id}"
     order_id, payment_url, _ = create_donation_order(
         session,
@@ -471,7 +465,6 @@ def create_qris_sync(config, user, amount=None, use_unique_code=True, note_prefi
         qris,
         qr_response.content,
         checkout_amount,
-        unique_code,
     )
 
 
@@ -496,16 +489,14 @@ async def create_invite_link(client, config, store, payment):
     return result.link, expires_at.replace(microsecond=0).isoformat()
 
 
-def qris_caption(config, inv_id, checkout_amount, unique_code, final_amount, expires):
+def qris_caption(config, inv_id, checkout_amount, final_amount, expires):
     public_invoice = html.escape(inv_id)
     human_expires = html.escape(format_qris_expiry(expires))
     lines = [
         "🔥 <b>Akses VIP Premium</b>",
         "",
         f"Kode pesanan: <code>{public_invoice}</code>",
-        f"Paket VIP: <b>{format_rupiah(config.payment_amount)}</b>",
-        f"Kode unik: <b>{unique_code:03d}</b>",
-        f"Total checkout: <b>{format_rupiah(checkout_amount)}</b>",
+        f"Paket VIP: <b>{format_rupiah(checkout_amount)}</b>",
     ]
     if final_amount:
         lines.append(f"Nominal QRIS: <b>{html.escape(final_amount)}</b>")
@@ -605,7 +596,6 @@ async def send_qris(event, config, store, qris_semaphore, invoice_message=None):
                 qris,
                 qr_bytes,
                 checkout_amount,
-                unique_code,
             ) = await asyncio.to_thread(create_qris_sync, config, user)
         socia_invoice_id = qris.get("inv_id")
         if not socia_invoice_id:
@@ -622,7 +612,6 @@ async def send_qris(event, config, store, qris_semaphore, invoice_message=None):
                 config,
                 buyer_invoice_id,
                 checkout_amount,
-                unique_code,
                 payload.get("amount") or "",
                 payload.get("countdown") or "",
             ),
@@ -653,8 +642,6 @@ async def send_qris(event, config, store, qris_semaphore, invoice_message=None):
                 f"Internal invoice: <code>{html.escape(socia_invoice_id)}</code>\n"
                 f"Source payment: <code>{html.escape(qris.get('source_payment') or '')}</code>\n"
                 f"Order: <code>{html.escape(order_id)}</code>\n"
-                f"Base amount: <code>{config.payment_amount}</code>\n"
-                f"Unique code: <code>{unique_code:03d}</code>\n"
                 f"Checkout amount: <code>{checkout_amount}</code>\n"
                 f"QRIS amount: <code>{html.escape(payload.get('amount') or '')}</code>"
             ),
@@ -689,8 +676,7 @@ async def send_custom_qris(event, config, store, qris_semaphore, amount):
                 qris,
                 qr_bytes,
                 checkout_amount,
-                unique_code,
-            ) = await asyncio.to_thread(create_qris_sync, config, user, amount, False, "CUSTOM")
+            ) = await asyncio.to_thread(create_qris_sync, config, user, amount, "CUSTOM")
         socia_invoice_id = qris.get("inv_id")
         if not socia_invoice_id:
             raise SociaBuzzError(f"QRIS response missing inv_id: {qris}")
