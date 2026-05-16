@@ -36,6 +36,14 @@ Jalankan SQL di `supabase_schema.sql` lewat Supabase SQL Editor sebelum bot dija
 
 Command `/setvip`, `/setlog`, dan `/config` hanya bisa dipakai Telegram user ID yang masuk `ADMIN_USER_IDS`.
 
+Admin juga bisa membuat QRIS nominal bebas dari group/channel logging:
+
+```text
+/custom 50000
+```
+
+Command `/custom` hanya diproses kalau dikirim oleh admin di `LOG_CHAT_ID`. QRIS custom akan muncul di chat logging dan statusnya tetap dicek otomatis.
+
 ## Run
 
 ```powershell

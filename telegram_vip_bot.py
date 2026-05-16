@@ -445,12 +445,13 @@ async def safe_send_user(client, config, store, user_id, text, **kwargs):
         return False
 
 
-def create_qris_sync(config, user):
+def create_qris_sync(config, user, amount=None, use_unique_code=True, note_prefix="VIP"):
     session = new_session(config.sociabuzz_cookie)
     buyer_name, buyer_email = random_indonesian_identity()
-    unique_code = unique_payment_code()
-    checkout_amount = config.payment_amount + unique_code
-    note = f"VIP {user.id}"
+    base_amount = amount if amount is not None else config.payment_amount
+    unique_code = unique_payment_code() if use_unique_code else 0
+    checkout_amount = base_amount + unique_code
+    note = f"{note_prefix} {user.id}"
     order_id, payment_url, _ = create_donation_order(
         session,
         config.sociabuzz_username,
@@ -520,6 +521,32 @@ def qris_caption(config, inv_id, checkout_amount, unique_code, final_amount, exp
             "• Status dicek otomatis, tidak perlu kirim bukti transfer.",
             "",
             "Setelah pembayaran terdeteksi, link VIP akan langsung dikirim otomatis.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def custom_qris_caption(inv_id, checkout_amount, final_amount, expires, user):
+    public_invoice = html.escape(inv_id)
+    human_expires = html.escape(format_qris_expiry(expires))
+    lines = [
+        "🧾 <b>Custom QRIS</b>",
+        "",
+        f"Kode pesanan: <code>{public_invoice}</code>",
+        f"Requester: {telegram_user_link(user)} (<code>{user.id}</code>)",
+        f"Nominal custom: <b>{format_rupiah(checkout_amount)}</b>",
+    ]
+    if final_amount:
+        lines.append(f"Nominal QRIS: <b>{html.escape(final_amount)}</b>")
+    if human_expires:
+        lines.append(f"⏳ Batas bayar: <b>{human_expires}</b>")
+    lines.extend(
+        [
+            "",
+            "📌 <b>Aturan pembayaran</b>",
+            "• Bayar <b>sesuai nominal QRIS</b>.",
+            "• Bayar <b>1 kali saja</b>, jangan diulang.",
+            "• Status akan dicek otomatis.",
         ]
     )
     return "\n".join(lines)
@@ -639,6 +666,86 @@ async def send_qris(event, config, store, qris_semaphore, invoice_message=None):
             LOGGER.warning("Failed to delete invoice message after create error", exc_info=True)
         await event.respond("Gagal membuat QRIS. Coba lagi beberapa saat lagi.")
         await send_log(event.client, config, store, f"<b>QRIS error</b>\n<code>{html.escape(str(exc))}</code>")
+
+
+async def send_custom_qris(event, config, store, qris_semaphore, amount):
+    user = await event.get_sender()
+    pending = store.latest_pending_for_user(user.id)
+    if pending:
+        await event.respond(
+            "Masih ada pembayaran yang sedang dicek untuk admin ini. Tunggu selesai dulu sebelum membuat custom QRIS baru."
+        )
+        return
+    invoice_message = await event.respond(f"⏳ Membuat custom QRIS {format_rupiah(amount)}...")
+    try:
+        async with qris_semaphore:
+            (
+                _session,
+                buyer_name,
+                buyer_email,
+                order_id,
+                payment_url,
+                qris,
+                qr_bytes,
+                checkout_amount,
+                unique_code,
+            ) = await asyncio.to_thread(create_qris_sync, config, user, amount, False, "CUSTOM")
+        socia_invoice_id = qris.get("inv_id")
+        if not socia_invoice_id:
+            raise SociaBuzzError(f"QRIS response missing inv_id: {qris}")
+
+        buyer_invoice_id = public_invoice_id()
+        qr_file = io.BytesIO(qr_bytes)
+        qr_file.name = f"{buyer_invoice_id}.png"
+        payload = qris.get("data", {})
+        invoice_message = await event.client.edit_message(
+            event.chat_id,
+            invoice_message.id,
+            custom_qris_caption(
+                buyer_invoice_id,
+                checkout_amount,
+                payload.get("amount") or "",
+                payload.get("countdown") or "",
+                user,
+            ),
+            file=qr_file,
+            parse_mode="html",
+        )
+        store.create_payment(
+            user,
+            buyer_invoice_id,
+            order_id,
+            payment_url,
+            socia_invoice_id,
+            checkout_amount,
+            buyer_name,
+            buyer_email,
+            qris,
+            event.chat_id,
+            invoice_message.id,
+        )
+        await send_log(
+            event.client,
+            config,
+            store,
+            (
+                "<b>Custom QRIS created</b>\n"
+                f"User: {telegram_user_link(user)} (<code>{user.id}</code>)\n"
+                f"Invoice: <code>{html.escape(buyer_invoice_id)}</code>\n"
+                f"Internal invoice: <code>{html.escape(socia_invoice_id)}</code>\n"
+                f"Order: <code>{html.escape(order_id)}</code>\n"
+                f"Custom amount: <code>{checkout_amount}</code>\n"
+                f"QRIS amount: <code>{html.escape(payload.get('amount') or '')}</code>"
+            ),
+        )
+    except Exception as exc:
+        LOGGER.exception("Failed to create custom QRIS")
+        try:
+            await invoice_message.delete()
+        except Exception:
+            LOGGER.warning("Failed to delete custom invoice message after create error", exc_info=True)
+        await event.respond("Gagal membuat custom QRIS. Coba lagi beberapa saat lagi.")
+        await send_log(event.client, config, store, f"<b>Custom QRIS error</b>\n<code>{html.escape(str(exc))}</code>")
 
 
 async def process_paid_payment(client, config, store, payment):
@@ -864,6 +971,18 @@ async def require_admin(event, config, store):
     return False
 
 
+async def require_log_chat(event, config, store):
+    try:
+        log_chat_id = runtime_log_chat_id(config, store)
+    except Exception as exc:
+        LOGGER.warning("Failed to load runtime log_chat_id for command guard: %s", exc)
+        log_chat_id = config.log_chat_id
+    if event.chat_id == log_chat_id and not event.is_private:
+        return True
+    await event.respond("Command ini cuma bisa dipakai di group/channel logging.")
+    return False
+
+
 async def main():
     config = load_config()
     store = PaymentStore(config)
@@ -915,6 +1034,29 @@ async def main():
         if not event.is_private and not await require_admin(event, config, store):
             return
         await event.respond(f"chat_id: `{event.chat_id}`")
+
+    @client.on(events.NewMessage(pattern=r"^/custom(?:@\w+)?(?:\s+(.+))?$"))
+    async def custom_payment(event):
+        if not await require_admin(event, config, store):
+            return
+        if not await require_log_chat(event, config, store):
+            return
+        raw_amount = (event.pattern_match.group(1) or "").strip()
+        if not raw_amount:
+            await event.respond("Format: `/custom 50000`")
+            return
+        digits = "".join(ch for ch in raw_amount if ch.isdigit())
+        if not digits:
+            await event.respond("Nominal custom harus angka. Contoh: `/custom 50000`")
+            return
+        amount = int(digits)
+        if amount < 1000:
+            await event.respond("Nominal custom minimal Rp1.000.")
+            return
+        if amount > 10_000_000:
+            await event.respond("Nominal custom maksimal Rp10.000.000.")
+            return
+        await send_custom_qris(event, config, store, qris_semaphore, amount)
 
     @client.on(events.NewMessage(pattern=r"^/setvip(?:\s+(.+))?$"))
     async def set_vip(event):
