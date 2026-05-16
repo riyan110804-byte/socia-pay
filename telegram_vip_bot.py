@@ -460,7 +460,7 @@ def create_qris_sync(config, user, amount=None, use_unique_code=True, note_prefi
         buyer_email,
         note,
     )
-    qris = create_qris(session, order_id, payment_url, checkout_amount)
+    qris = create_qris(session, order_id, payment_url, checkout_amount, source_payment="xendit")
     qr_response = download_qr_response(session, qris)
     return (
         session,
@@ -651,6 +651,7 @@ async def send_qris(event, config, store, qris_semaphore, invoice_message=None):
                 f"User: {telegram_user_link(user)} (<code>{user.id}</code>)\n"
                 f"Invoice: <code>{html.escape(buyer_invoice_id)}</code>\n"
                 f"Internal invoice: <code>{html.escape(socia_invoice_id)}</code>\n"
+                f"Source payment: <code>{html.escape(qris.get('source_payment') or '')}</code>\n"
                 f"Order: <code>{html.escape(order_id)}</code>\n"
                 f"Base amount: <code>{config.payment_amount}</code>\n"
                 f"Unique code: <code>{unique_code:03d}</code>\n"
@@ -733,6 +734,7 @@ async def send_custom_qris(event, config, store, qris_semaphore, amount):
                 f"User: {telegram_user_link(user)} (<code>{user.id}</code>)\n"
                 f"Invoice: <code>{html.escape(buyer_invoice_id)}</code>\n"
                 f"Internal invoice: <code>{html.escape(socia_invoice_id)}</code>\n"
+                f"Source payment: <code>{html.escape(qris.get('source_payment') or '')}</code>\n"
                 f"Order: <code>{html.escape(order_id)}</code>\n"
                 f"Custom amount: <code>{checkout_amount}</code>\n"
                 f"QRIS amount: <code>{html.escape(payload.get('amount') or '')}</code>"

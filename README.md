@@ -1,6 +1,7 @@
 # SociaBuzz QRIS VIP Telegram Bot
 
 Bot Telegram untuk menjual akses group VIP memakai QRIS. Teks bot hanya menyebut QRIS, tidak menyebut SociaBuzz.
+QRIS dibuat lewat source payment Xendit supaya mengikuti flow QRIS website SociaBuzz.
 
 ## Setup
 
