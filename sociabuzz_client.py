@@ -1,4 +1,5 @@
 import json
+import io
 import re
 import time
 from pathlib import Path
@@ -157,7 +158,7 @@ def create_donation_order(session, username, amount, name, email, note, debug=Fa
     return order_id, payment_url, data
 
 
-def create_qris(session, order_id, payment_url, amount, debug=False, logger=noop_log):
+def create_qris(session, order_id, payment_url, amount, source_payment="midtrans", debug=False, logger=noop_log):
     logger(f"[4/5] Opening payment page: {payment_url}")
     payment_response = request_or_fail(session, "GET", payment_url)
     payment_html = payment_response.text
@@ -187,7 +188,7 @@ def create_qris(session, order_id, payment_url, amount, debug=False, logger=noop
         "currency_def": "IDR",
         "payment_method": "qris",
         "type_payment": "qris",
-        "source_payment": "midtrans",
+        "source_payment": source_payment,
         "country": "ID",
         "country_pay": "Indonesia",
     }
@@ -226,10 +227,31 @@ def download_qr(session, qris_data, output_path):
 
 
 def download_qr_response(session, qris_data):
-    qr_url = qris_data.get("data", {}).get("qr_string")
-    if not qr_url:
+    qr_string = qris_data.get("data", {}).get("qr_string")
+    if not qr_string:
         raise SociaBuzzError("QR response has no data.qr_string.")
-    return request_or_fail(session, "GET", qr_url)
+    if re.match(r"^https?://", qr_string, flags=re.I):
+        return request_or_fail(session, "GET", qr_string)
+    return LocalResponse(render_qr_payload(qr_string))
+
+
+class LocalResponse:
+    def __init__(self, content):
+        self.content = content
+
+
+def render_qr_payload(qr_payload):
+    try:
+        import qrcode
+    except ImportError as exc:
+        raise SociaBuzzError(
+            "Xendit returns a direct QRIS payload, not an image URL. "
+            "Install QR renderer first: pip install qrcode[pil]"
+        ) from exc
+    image = qrcode.make(qr_payload)
+    output = io.BytesIO()
+    image.save(output, format="PNG")
+    return output.getvalue()
 
 
 def check_pending(session, inv_id, logger=noop_log):
@@ -259,4 +281,3 @@ def poll_status(session, inv_id, interval, max_polls, logger=noop_log):
             logger(f"Waiting {interval}s before next check...")
             time.sleep(interval)
     return "pending"
-

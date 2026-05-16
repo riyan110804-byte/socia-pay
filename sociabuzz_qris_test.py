@@ -23,6 +23,12 @@ def parse_args():
     )
     parser.add_argument("--username", default=DEFAULT_USERNAME)
     parser.add_argument("--amount", default="1000", help="Donation amount in IDR, e.g. 1000")
+    parser.add_argument(
+        "--source-payment",
+        default="midtrans",
+        choices=("midtrans", "xendit"),
+        help="QRIS payment source. Use xendit to match SociaBuzz website QRIS.",
+    )
     parser.add_argument("--name", default="Tester API")
     parser.add_argument("--email", default="tester@example.com")
     parser.add_argument("--note", default="test api trace")
@@ -73,7 +79,15 @@ def main():
             debug=args.debug,
             logger=log,
         )
-        qris = create_qris(session, order_id, payment_url, args.amount, debug=args.debug, logger=log)
+        qris = create_qris(
+            session,
+            order_id,
+            payment_url,
+            args.amount,
+            source_payment=args.source_payment,
+            debug=args.debug,
+            logger=log,
+        )
 
         inv_id = qris.get("inv_id")
         qris_payload = qris.get("data", {})
@@ -81,6 +95,7 @@ def main():
         log(f"order_id      : {order_id}")
         log(f"payment_url   : {payment_url}")
         log(f"inv_id        : {inv_id}")
+        log(f"source_payment: {qris.get('source_payment')}")
         log(f"amount        : {qris_payload.get('amount')}")
         log(f"qr_string     : {qris_payload.get('qr_string')}")
         log(f"expires       : {qris_payload.get('countdown')}")
