@@ -14,7 +14,7 @@ from dataclasses import dataclass
 import httpx
 from dotenv import load_dotenv
 from supabase import create_client
-from telethon import Button, TelegramClient, events, functions
+from telethon import Button, TelegramClient, events, functions, errors
 
 from sociabuzz_client import (
     SociaBuzzError,
@@ -218,6 +218,11 @@ class PaymentStore:
             "updated_at": now,
         }
         self._execute(self.client.table(self.table).insert(data), "create payment")
+
+    def ensure_payment_schema_ready(self):
+        columns = "id,package_code,package_name,package_amount,vip_chat_id,invite_expire_hours"
+        query = self.client.table(self.table).select(columns).limit(1)
+        self._execute(query, "check payment schema")
 
     def list_packages(self, include_inactive=False):
         query = self.client.table(self.package_table).select("*")
@@ -684,8 +689,29 @@ async def send_qris(event, config, store, qris_semaphore, package=None, invoice_
     if invoice_message is None:
         invoice_message = await event.respond("⏳ Membuat QRIS...")
     else:
-        await event.client.edit_message(event.chat_id, invoice_message.id, "⏳ Membuat QRIS...")
+        try:
+            await event.client.edit_message(event.chat_id, invoice_message.id, "⏳ Membuat QRIS...")
+        except errors.MessageNotModifiedError:
+            pass
     try:
+        try:
+            await asyncio.to_thread(store.ensure_payment_schema_ready)
+        except Exception as exc:
+            LOGGER.exception("Payment schema is not ready")
+            await invoice_message.edit(
+                "Bot sedang maintenance database. Admin perlu jalankan ulang `supabase_schema.sql`, lalu coba lagi.",
+            )
+            await send_log(
+                event.client,
+                config,
+                store,
+                (
+                    "<b>Database schema not ready</b>\n"
+                    "Action: <code>Run supabase_schema.sql in Supabase SQL Editor</code>\n"
+                    f"Error: <code>{html.escape(str(exc))}</code>"
+                ),
+            )
+            return
         async with qris_semaphore:
             (
                 _session,
