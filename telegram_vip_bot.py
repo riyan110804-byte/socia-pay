@@ -358,6 +358,9 @@ class PaymentStore:
     def mark_delivery_error(self, inv_id, error):
         return self.mark_status_if_current(inv_id, "processing_delivery", "delivery_error", error[:1000])
 
+    def mark_delivery_blocked(self, inv_id, error):
+        return self.mark_status_if_current(inv_id, "processing_delivery", "delivery_blocked", error[:1000])
+
     def mark_paid(self, inv_id, invite_link, invite_expires_at):
         query = (
             self.client.table(self.table)
@@ -470,6 +473,15 @@ def is_active_payment_duplicate(exc):
     return "idx_vip_payments_one_active_per_user" in str(exc)
 
 
+def is_cloudflare_challenge(exc):
+    text = str(exc)
+    return "HTTP 403" in text and ("Just a moment" in text or "challenges.cloudflare.com" in text)
+
+
+def is_user_blocked_error(exc):
+    return isinstance(exc, errors.UserIsBlockedError) or "User is blocked" in str(exc)
+
+
 def format_qris_expiry(raw_expires):
     if not raw_expires:
         return ""
@@ -519,9 +531,14 @@ async def send_log(client, config, store, text):
 async def safe_send_user(client, config, store, user_id, text, **kwargs):
     try:
         await client.send_message(user_id, text, **kwargs)
-        return True
+        return "sent"
     except Exception as exc:
-        LOGGER.exception("Failed to send message to user %s", user_id)
+        if is_user_blocked_error(exc):
+            LOGGER.warning("User %s blocked the bot, cannot deliver message", user_id)
+            status = "blocked"
+        else:
+            LOGGER.exception("Failed to send message to user %s", user_id)
+            status = "error"
         await send_log(
             client,
             config,
@@ -532,7 +549,7 @@ async def safe_send_user(client, config, store, user_id, text, **kwargs):
                 f"Error: <code>{html.escape(str(exc))}</code>"
             ),
         )
-        return False
+        return status
 
 
 def create_qris_sync(config, user, amount=None, note_prefix="VIP"):
@@ -788,11 +805,27 @@ async def send_qris_locked(event, config, store, qris_semaphore, user, package=N
             ),
         )
     except Exception as exc:
-        LOGGER.exception("Failed to create QRIS")
+        if is_cloudflare_challenge(exc):
+            LOGGER.warning("SociaBuzz Cloudflare challenge while creating QRIS for user %s", user.id)
+        else:
+            LOGGER.exception("Failed to create QRIS")
         try:
             await invoice_message.delete()
         except Exception:
             LOGGER.warning("Failed to delete invoice message after create error", exc_info=True)
+        if is_cloudflare_challenge(exc):
+            await event.respond("QRIS belum bisa dibuat karena gateway pembayaran sedang membatasi request. Coba lagi beberapa menit lagi.")
+            await send_log(
+                event.client,
+                config,
+                store,
+                (
+                    "<b>QRIS gateway blocked</b>\n"
+                    f"User: {telegram_user_link(user)} (<code>{user.id}</code>)\n"
+                    "Reason: <code>SociaBuzz Cloudflare HTTP 403</code>"
+                ),
+            )
+            return
         if is_active_payment_duplicate(exc):
             await event.respond("Masih ada pembayaran yang sedang dicek. Tunggu statusnya selesai dulu sebelum membuat QRIS baru.")
             await send_log(
@@ -889,11 +922,27 @@ async def send_custom_qris_locked(event, config, store, qris_semaphore, user, am
             ),
         )
     except Exception as exc:
-        LOGGER.exception("Failed to create custom QRIS")
+        if is_cloudflare_challenge(exc):
+            LOGGER.warning("SociaBuzz Cloudflare challenge while creating custom QRIS for user %s", user.id)
+        else:
+            LOGGER.exception("Failed to create custom QRIS")
         try:
             await invoice_message.delete()
         except Exception:
             LOGGER.warning("Failed to delete custom invoice message after create error", exc_info=True)
+        if is_cloudflare_challenge(exc):
+            await event.respond("Custom QRIS belum bisa dibuat karena gateway pembayaran sedang membatasi request. Coba lagi beberapa menit lagi.")
+            await send_log(
+                event.client,
+                config,
+                store,
+                (
+                    "<b>Custom QRIS gateway blocked</b>\n"
+                    f"User: {telegram_user_link(user)} (<code>{user.id}</code>)\n"
+                    "Reason: <code>SociaBuzz Cloudflare HTTP 403</code>"
+                ),
+            )
+            return
         if is_active_payment_duplicate(exc):
             await event.respond("Masih ada pembayaran yang sedang dicek untuk admin ini. Tunggu selesai dulu sebelum membuat custom QRIS baru.")
             await send_log(
@@ -953,7 +1002,7 @@ async def process_paid_payment(client, config, store, payment):
             return
 
     await delete_qris_message(client, payment)
-    delivered = await safe_send_user(
+    delivery_status = await safe_send_user(
         client,
         config,
         store,
@@ -966,8 +1015,22 @@ async def process_paid_payment(client, config, store, payment):
         parse_mode="html",
         link_preview=False,
     )
-    if not delivered:
-        store.mark_delivery_error(payment["inv_id"], "Failed to send invite link to user")
+    if delivery_status != "sent":
+        if delivery_status == "blocked":
+            store.mark_delivery_blocked(payment["inv_id"], "User blocked the bot")
+            await send_log(
+                client,
+                config,
+                store,
+                (
+                    "<b>Invite delivery blocked</b>\n"
+                    f"User: {user_link(payment)} (<code>{payment['user_id']}</code>)\n"
+                    f"Invoice: <code>{html.escape(payment.get('public_invoice_id') or payment['inv_id'])}</code>\n"
+                    "Status: <code>User blocked the bot, delivery will not be retried</code>"
+                ),
+            )
+        else:
+            store.mark_delivery_error(payment["inv_id"], "Failed to send invite link to user")
         return
 
     changed = store.mark_paid(payment["inv_id"], invite_link, invite_expires_at)
@@ -1046,6 +1109,26 @@ async def poll_once(client, config, store, payment):
                 ),
             )
     except Exception as exc:
+        if is_cloudflare_challenge(exc):
+            marker = "SociaBuzz Cloudflare HTTP 403"
+            previous_error = payment.get("error") or ""
+            if marker not in previous_error:
+                LOGGER.warning("SociaBuzz Cloudflare challenge while polling %s", payment["inv_id"])
+            if payment["status"] == "pending":
+                store.set_error(payment["inv_id"], marker)
+            if marker not in previous_error:
+                await send_log(
+                    client,
+                    config,
+                    store,
+                    (
+                        "<b>Polling gateway blocked</b>\n"
+                        f"Invoice: <code>{html.escape(payment.get('public_invoice_id') or payment['inv_id'])}</code>\n"
+                        f"Internal invoice: <code>{html.escape(payment['inv_id'])}</code>\n"
+                        "Reason: <code>SociaBuzz Cloudflare HTTP 403</code>"
+                    ),
+                )
+            return
         LOGGER.exception("Polling failed for %s", payment["inv_id"])
         if payment["status"] == "pending":
             store.set_error(payment["inv_id"], str(exc))
