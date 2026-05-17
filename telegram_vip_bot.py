@@ -88,6 +88,7 @@ class Config:
     invite_expire_hours: int
     poll_interval_seconds: int
     poll_max_attempts: int
+    poll_batch_size: int
     qris_create_concurrency: int
     admin_user_ids: set[int]
     supabase_url: str
@@ -139,6 +140,7 @@ def load_config():
         invite_expire_hours=env_int("INVITE_EXPIRE_HOURS", 24),
         poll_interval_seconds=env_int("POLL_INTERVAL_SECONDS", 3),
         poll_max_attempts=env_int("POLL_MAX_ATTEMPTS", 300),
+        poll_batch_size=max(1, env_int("POLL_BATCH_SIZE", 20)),
         qris_create_concurrency=max(1, env_int("QRIS_CREATE_CONCURRENCY", 5)),
         admin_user_ids=parse_admin_ids(os.getenv("ADMIN_USER_IDS", "")),
         supabase_url=env_required("SUPABASE_URL"),
@@ -193,6 +195,8 @@ class PaymentStore:
         now = utc_now_iso()
         payload = qris_data.get("data", {})
         package = package or {}
+        expires_at = parse_iso_datetime(payload.get("countdown") or "")
+        next_check_at = next_poll_at(dt.datetime.now(dt.UTC), expires_at, attempts=0, error="")
         data = {
             "user_id": user.id,
             "username": user.username or "",
@@ -214,13 +218,15 @@ class PaymentStore:
             "qris_expires": payload.get("countdown") or "",
             "qris_chat_id": qris_chat_id,
             "qris_message_id": qris_message_id,
+            "next_check_at": next_check_at,
+            "poll_attempts": 0,
             "created_at": now,
             "updated_at": now,
         }
         self._execute(self.client.table(self.table).insert(data), "create payment")
 
     def ensure_payment_schema_ready(self):
-        columns = "id,package_code,package_name,package_amount,vip_chat_id,invite_expire_hours"
+        columns = "id,package_code,package_name,package_amount,vip_chat_id,invite_expire_hours,next_check_at,poll_attempts,last_polled_at"
         query = self.client.table(self.table).select(columns).limit(1)
         self._execute(query, "check payment schema")
 
@@ -274,19 +280,22 @@ class PaymentStore:
         rows.sort(key=lambda item: item["id"], reverse=True)
         return rows[0] if rows else None
 
-    def retryable_payments(self):
+    def retryable_payments(self, due_before, limit):
         rows = []
         for status in RETRYABLE_PAYMENT_STATUSES:
             query = (
                 self.client.table(self.table)
                 .select("*")
                 .eq("status", status)
+                .lte("next_check_at", due_before)
+                .order("next_check_at", desc=False)
                 .order("id", desc=False)
+                .limit(limit)
             )
             response = self._execute(query, f"retryable payments {status}")
             rows.extend(response.data or [])
-        rows.sort(key=lambda item: item["id"])
-        return rows
+        rows.sort(key=lambda item: ((item.get("next_check_at") or ""), item["id"]))
+        return rows[:limit]
 
     def recover_stale_processing(self, older_than_seconds=300):
         cutoff = (dt.datetime.now(dt.UTC) - dt.timedelta(seconds=older_than_seconds)).replace(microsecond=0).isoformat()
@@ -320,11 +329,31 @@ class PaymentStore:
         self._execute(query, "set payment error")
 
     def mark_status_if_current(self, inv_id, from_status, to_status, error=""):
+        data = {"status": to_status, "error": error, "updated_at": utc_now_iso()}
+        if to_status in RETRYABLE_PAYMENT_STATUSES:
+            data["next_check_at"] = utc_now_iso()
+        else:
+            data["next_check_at"] = None
         query = self.client.table(self.table).update(
-            {"status": to_status, "error": error, "updated_at": utc_now_iso()}
+            data
         ).eq("inv_id", inv_id).eq("status", from_status)
         response = self._execute(query, f"mark status {from_status} to {to_status}")
         return bool(response.data)
+
+    def record_poll_result(self, payment, next_check_at, error=""):
+        attempts = int(payment.get("poll_attempts") or 0) + 1
+        data = {
+            "poll_attempts": attempts,
+            "last_polled_at": utc_now_iso(),
+            "next_check_at": next_check_at,
+            "updated_at": utc_now_iso(),
+        }
+        if error:
+            data["error"] = error[:1000]
+        elif payment.get("error"):
+            data["error"] = ""
+        query = self.client.table(self.table).update(data).eq("inv_id", payment["inv_id"]).eq("status", payment["status"])
+        self._execute(query, "record poll result")
 
     def claim_paid_processing(self, inv_id):
         return self.mark_status_if_current(inv_id, "pending", "processing_paid") or self.mark_status_if_current(
@@ -342,6 +371,7 @@ class PaymentStore:
                     "status": "processing_delivery",
                     "invite_link": invite_link,
                     "invite_expires_at": invite_expires_at,
+                    "next_check_at": None,
                     "error": "",
                     "updated_at": utc_now_iso(),
                 }
@@ -369,6 +399,7 @@ class PaymentStore:
                     "status": "paid",
                     "invite_link": invite_link,
                     "invite_expires_at": invite_expires_at,
+                    "next_check_at": None,
                     "updated_at": utc_now_iso(),
                 }
             )
@@ -402,6 +433,62 @@ class PaymentStore:
 
 def utc_now_iso():
     return dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat()
+
+
+def parse_iso_datetime(raw):
+    if not raw:
+        return None
+    if isinstance(raw, dt.datetime):
+        parsed = raw
+    else:
+        try:
+            parsed = dt.datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.UTC)
+    return parsed.astimezone(dt.UTC)
+
+
+def adaptive_poll_delay(created_at, expires_at, attempts=0, error=""):
+    now = dt.datetime.now(dt.UTC)
+    if expires_at:
+        remaining = (expires_at - now).total_seconds()
+        if remaining <= 0:
+            return None
+        total = max((expires_at - created_at).total_seconds(), 1)
+        elapsed = max((now - created_at).total_seconds(), 0)
+        progress = max(0.0, min(1.0, elapsed / total))
+    else:
+        remaining = None
+        total = 1800
+        progress = min(1.0, max(0, attempts) / 300)
+
+    if error:
+        base = min(180, max(30, 20 * max(1, min(int(attempts or 1), 6))))
+        if remaining is None:
+            return base
+        return max(5, min(base, int(max(5, remaining / 2))))
+
+    if remaining is not None:
+        final_window = max(30, min(120, total * 0.20))
+        if remaining <= final_window:
+            return 5
+
+    if progress < 0.05:
+        return 5
+    if progress < 0.15:
+        return 8
+    if progress < 0.75:
+        return min(45, max(12, int(total * 0.015)))
+    return 10
+
+
+def next_poll_at(created_at, expires_at, attempts=0, error=""):
+    delay = adaptive_poll_delay(created_at, expires_at, attempts=attempts, error=error)
+    if delay is None:
+        return None
+    return (dt.datetime.now(dt.UTC) + dt.timedelta(seconds=delay)).replace(microsecond=0).isoformat()
 
 
 def display_name(user):
@@ -485,11 +572,10 @@ def is_user_blocked_error(exc):
 def format_qris_expiry(raw_expires):
     if not raw_expires:
         return ""
-    try:
-        parsed = dt.datetime.fromisoformat(raw_expires)
-    except ValueError:
+    parsed = parse_iso_datetime(raw_expires)
+    if not parsed:
         return raw_expires
-    return parsed.strftime("%d/%m/%Y %H:%M WIB")
+    return parsed.astimezone(dt.timezone(dt.timedelta(hours=7))).strftime("%d/%m/%Y %H:%M WIB")
 
 
 def user_link(row):
@@ -861,6 +947,24 @@ async def send_custom_qris_locked(event, config, store, qris_semaphore, user, am
         return
     invoice_message = await event.respond(f"⏳ Membuat custom QRIS {format_rupiah(amount)}...")
     try:
+        try:
+            await asyncio.to_thread(store.ensure_payment_schema_ready)
+        except Exception as exc:
+            LOGGER.exception("Payment schema is not ready")
+            await invoice_message.edit(
+                "Bot sedang maintenance database. Admin perlu jalankan ulang `supabase_schema.sql`, lalu coba lagi.",
+            )
+            await send_log(
+                event.client,
+                config,
+                store,
+                (
+                    "<b>Database schema not ready</b>\n"
+                    "Action: <code>Run supabase_schema.sql in Supabase SQL Editor</code>\n"
+                    f"Error: <code>{html.escape(str(exc))}</code>"
+                ),
+            )
+            return
         async with qris_semaphore:
             (
                 _session,
@@ -1108,6 +1212,11 @@ async def poll_once(client, config, store, payment):
                     f"Check: {html.escape(status_url)}"
                 ),
             )
+        else:
+            created_at = parse_iso_datetime(payment.get("created_at")) or dt.datetime.now(dt.UTC)
+            expires_at = parse_iso_datetime(payment.get("qris_expires"))
+            attempts = int(payment.get("poll_attempts") or 0) + 1
+            store.record_poll_result(payment, next_poll_at(created_at, expires_at, attempts=attempts, error="") or utc_now_iso())
     except Exception as exc:
         if is_cloudflare_challenge(exc):
             marker = "SociaBuzz Cloudflare HTTP 403"
@@ -1115,7 +1224,14 @@ async def poll_once(client, config, store, payment):
             if marker not in previous_error:
                 LOGGER.warning("SociaBuzz Cloudflare challenge while polling %s", payment["inv_id"])
             if payment["status"] == "pending":
-                store.set_error(payment["inv_id"], marker)
+                created_at = parse_iso_datetime(payment.get("created_at")) or dt.datetime.now(dt.UTC)
+                expires_at = parse_iso_datetime(payment.get("qris_expires"))
+                attempts = int(payment.get("poll_attempts") or 0) + 1
+                store.record_poll_result(
+                    payment,
+                    next_poll_at(created_at, expires_at, attempts=attempts, error=marker) or utc_now_iso(),
+                    error=marker,
+                )
             if marker not in previous_error:
                 await send_log(
                     client,
@@ -1127,11 +1243,18 @@ async def poll_once(client, config, store, payment):
                         f"Internal invoice: <code>{html.escape(payment['inv_id'])}</code>\n"
                         "Reason: <code>SociaBuzz Cloudflare HTTP 403</code>"
                     ),
-                )
+            )
             return
         LOGGER.exception("Polling failed for %s", payment["inv_id"])
         if payment["status"] == "pending":
-            store.set_error(payment["inv_id"], str(exc))
+            created_at = parse_iso_datetime(payment.get("created_at")) or dt.datetime.now(dt.UTC)
+            expires_at = parse_iso_datetime(payment.get("qris_expires"))
+            attempts = int(payment.get("poll_attempts") or 0) + 1
+            store.record_poll_result(
+                payment,
+                next_poll_at(created_at, expires_at, attempts=attempts, error=str(exc)) or utc_now_iso(),
+                error=str(exc),
+            )
         await send_log(
             client,
             config,
@@ -1144,40 +1267,47 @@ async def poll_once(client, config, store, payment):
         )
 
 
+async def expire_pending_payment(client, config, store, payment, title="Payment expired"):
+    changed = store.mark_status_if_current(payment["inv_id"], "pending", "timeout")
+    if not changed:
+        return
+    await delete_qris_message(client, payment)
+    await safe_send_user(
+        client,
+        config,
+        store,
+        payment["user_id"],
+        timeout_payment_message(),
+        parse_mode="html",
+        buttons=package_buttons(config, store),
+    )
+    await send_log(
+        client,
+        config,
+        store,
+        (
+            f"<b>{html.escape(title)}</b>\n"
+            f"User: {user_link(payment)} (<code>{payment['user_id']}</code>)\n"
+            f"Package: <code>{html.escape(payment.get('package_code') or '')}</code> {html.escape(payment.get('package_name') or '')}\n"
+            f"Invoice: <code>{html.escape(payment.get('public_invoice_id') or payment['inv_id'])}</code>\n"
+            f"Internal invoice: <code>{html.escape(payment['inv_id'])}</code>"
+        ),
+    )
+
+
 async def polling_loop(client, config, store):
-    attempts = {}
     while True:
         try:
             store.recover_stale_processing()
-            pending = store.retryable_payments()
+            pending = store.retryable_payments(utc_now_iso(), config.poll_batch_size)
             for payment in pending:
-                count = attempts.get(payment["inv_id"], 0) + 1
-                attempts[payment["inv_id"]] = count
-                if payment["status"] == "pending" and count > config.poll_max_attempts:
-                    changed = store.mark_status_if_current(payment["inv_id"], "pending", "timeout")
-                    if changed:
-                        await delete_qris_message(client, payment)
-                        await safe_send_user(
-                            client,
-                            config,
-                            store,
-                            payment["user_id"],
-                            timeout_payment_message(),
-                            parse_mode="html",
-                            buttons=package_buttons(config, store),
-                        )
-                        await send_log(
-                            client,
-                            config,
-                            store,
-                            (
-                                "<b>Payment timeout</b>\n"
-                                f"User: {user_link(payment)} (<code>{payment['user_id']}</code>)\n"
-                                f"Package: <code>{html.escape(payment.get('package_code') or '')}</code> {html.escape(payment.get('package_name') or '')}\n"
-                                f"Invoice: <code>{html.escape(payment.get('public_invoice_id') or payment['inv_id'])}</code>\n"
-                                f"Internal invoice: <code>{html.escape(payment['inv_id'])}</code>"
-                            ),
-                        )
+                expires_at = parse_iso_datetime(payment.get("qris_expires"))
+                if payment["status"] == "pending" and expires_at and expires_at <= dt.datetime.now(dt.UTC):
+                    await expire_pending_payment(client, config, store, payment)
+                    continue
+                count = int(payment.get("poll_attempts") or 0)
+                if payment["status"] == "pending" and count >= config.poll_max_attempts:
+                    await expire_pending_payment(client, config, store, payment, title="Payment timeout")
                     continue
                 await poll_once(client, config, store, payment)
         except Exception as exc:

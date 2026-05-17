@@ -64,7 +64,7 @@ python telegram_vip_bot.py
 
 User DM bot lalu `/start`, pilih paket seperti `group a - 5.000`, message tombol akan berubah menjadi invoice QRIS. Nominal checkout mengikuti paket yang dipilih. Setelah pembayaran terdeteksi, bot menghapus QRIS dan mengirim invite link ke group paket tersebut. Kalau pembayaran gagal/expired/tidak valid, bot juga menghapus QRIS supaya tidak terscan lagi. Invite link berlaku sesuai `INVITE_EXPIRE_HOURS` dan hanya bisa dipakai 1 kali. Log transaksi menyimpan paket, kode pesanan internal, kode pesanan user, nominal checkout, nominal QRIS, dan invite link yang dikirim.
 
-Kalau database sudah pernah dibuat sebelum versi ini, jalankan ulang isi `supabase_schema.sql` di SQL Editor supaya tabel `vip_packages`, kolom paket payment, dan status recovery production ikut aktif.
+Kalau database sudah pernah dibuat sebelum versi ini, jalankan ulang isi `supabase_schema.sql` di SQL Editor supaya tabel `vip_packages`, kolom paket payment, status recovery production, dan kolom adaptive polling ikut aktif.
 
 Bot membatasi pembuatan QRIS bersamaan lewat `QRIS_CREATE_CONCURRENCY` supaya traffic ramai tetap antre rapi. Default `5` cukup aman untuk awal; naikkan pelan-pelan kalau SociaBuzz tetap stabil.
 
@@ -96,9 +96,12 @@ Set variables ini di Railway:
 - `INVITE_EXPIRE_HOURS=24`
 - `POLL_INTERVAL_SECONDS=3`
 - `POLL_MAX_ATTEMPTS=300`
+- `POLL_BATCH_SIZE=20`
 - `QRIS_CREATE_CONCURRENCY=5`
 
 State invoice disimpan di Supabase, jadi Railway tidak perlu Volume. Gunakan `service_role` key hanya di Railway Variables, jangan taruh di frontend atau repo.
+
+Polling payment bersifat adaptive. Bot menyimpan `next_check_at`, `poll_attempts`, dan `last_polled_at` di Supabase, lalu hanya mengecek invoice yang sudah waktunya dicek. Intervalnya dihitung dari `qris_expires` asli tiap invoice, jadi QRIS yang expire cepat otomatis dicek lebih rapat dan QRIS yang masih jauh dari expired dicek lebih santai. `POLL_BATCH_SIZE` membatasi jumlah invoice yang diproses per loop supaya Railway dan gateway pembayaran tidak dihajar semua pending user sekaligus.
 
 Kalau Supabase/PostgREST memutus koneksi HTTP/2 saat polling, bot akan retry query Supabase sesuai `SUPABASE_QUERY_RETRIES` sebelum menulis error ke log channel.
 

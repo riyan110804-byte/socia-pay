@@ -34,6 +34,9 @@ CREATE TABLE IF NOT EXISTS public.vip_payments (
     qris_expires TEXT NOT NULL DEFAULT '',
     qris_chat_id BIGINT,
     qris_message_id BIGINT,
+    next_check_at TIMESTAMPTZ,
+    poll_attempts INTEGER NOT NULL DEFAULT 0,
+    last_polled_at TIMESTAMPTZ,
     invite_link TEXT,
     invite_expires_at TIMESTAMPTZ,
     error TEXT NOT NULL DEFAULT '',
@@ -70,6 +73,24 @@ ADD COLUMN IF NOT EXISTS qris_chat_id BIGINT;
 
 ALTER TABLE public.vip_payments
 ADD COLUMN IF NOT EXISTS qris_message_id BIGINT;
+
+ALTER TABLE public.vip_payments
+ADD COLUMN IF NOT EXISTS next_check_at TIMESTAMPTZ;
+
+ALTER TABLE public.vip_payments
+ADD COLUMN IF NOT EXISTS poll_attempts INTEGER NOT NULL DEFAULT 0;
+
+ALTER TABLE public.vip_payments
+ADD COLUMN IF NOT EXISTS last_polled_at TIMESTAMPTZ;
+
+UPDATE public.vip_payments
+SET next_check_at = now()
+WHERE status IN ('pending', 'invite_error', 'delivery_error')
+  AND next_check_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_vip_payments_next_check
+ON public.vip_payments (next_check_at ASC, id ASC)
+WHERE status IN ('pending', 'invite_error', 'delivery_error');
 
 CREATE INDEX IF NOT EXISTS idx_vip_payments_package_code
 ON public.vip_payments (package_code);
