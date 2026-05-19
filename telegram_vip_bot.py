@@ -754,11 +754,14 @@ def custom_qris_caption(inv_id, checkout_amount, final_amount, expires, user):
 
 
 def paid_message(invite_link, package_name="VIP", invite_hours=24):
+    safe_package_name = html.escape(package_name)
     return (
         "✅ <b>Pembayaran berhasil terdeteksi</b>\n\n"
-        f"Akses <b>{html.escape(package_name)}</b> kamu sudah aktif. Pakai link di bawah ini untuk masuk:\n\n"
-        f"🔐 <b>Link VIP</b>\n{html.escape(invite_link)}\n\n"
-        f"⚠️ Link ini hanya bisa dipakai <b>1 kali</b> dan berlaku <b>{int(invite_hours)} jam</b>."
+        f"Akses <b>{safe_package_name}</b> kamu sudah aktif.\n\n"
+        "1️⃣ Join group lewat link ini dulu:\n"
+        f"{html.escape(invite_link)}\n\n"
+        "2️⃣ Setelah sudah join, buka group lagi lewat tombol di bawah.\n\n"
+        f"⚠️ Link join hanya bisa dipakai <b>1 kali</b> dan berlaku <b>{int(invite_hours)} jam</b>."
     )
 
 
