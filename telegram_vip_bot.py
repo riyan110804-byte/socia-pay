@@ -700,18 +700,22 @@ async def create_invite_link(client, config, store, payment):
 
 def qris_caption(package, inv_id, checkout_amount, final_amount, expires):
     public_invoice = html.escape(inv_id)
+    package_name = html.escape(package["name"])
     human_expires = html.escape(format_qris_expiry(expires))
+    detail_lines = [
+        f"Kode pesanan: {public_invoice}",
+        f"Paket: {package_name}",
+        f"Nominal paket: {format_rupiah(checkout_amount)}",
+    ]
+    if final_amount:
+        detail_lines.append(f"Nominal QRIS: {html.escape(final_amount)}")
+    if human_expires:
+        detail_lines.append(f"⏳ Batas bayar: {human_expires}")
     lines = [
         "🔥 <b>Akses VIP Premium</b>",
         "",
-        f"Kode pesanan: <code>{public_invoice}</code>",
-        f"Paket: <b>{html.escape(package['name'])}</b>",
-        f"Nominal paket: <code>{format_rupiah(checkout_amount)}</code>",
+        f"<blockquote>{'\n'.join(detail_lines)}</blockquote>",
     ]
-    if final_amount:
-        lines.append(f"Nominal QRIS: <code>{html.escape(final_amount)}</code>")
-    if human_expires:
-        lines.append(f"⏳ Batas bayar: <code>{human_expires}</code>")
     lines.extend(
         [
             "",
