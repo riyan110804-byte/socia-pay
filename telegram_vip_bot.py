@@ -763,7 +763,7 @@ def paid_message(invite_link, package_name="VIP", invite_hours=24):
         "✅ <b>Pembayaran berhasil terdeteksi</b>\n\n"
         f"Akses <b>{safe_package_name}</b> kamu sudah aktif.\n\n"
         "1️⃣ Join group lewat link ini dulu:\n"
-        f"<code>{html.escape(invite_link)}</code>\n\n"
+        f"{html.escape(invite_link)}\n\n"
         "2️⃣ Setelah sudah join, buka group lagi lewat tombol di bawah.\n\n"
         f"⚠️ Link join hanya bisa dipakai <b>1 kali</b> dan berlaku <b>{int(invite_hours)} jam</b>."
     )
