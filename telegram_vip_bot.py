@@ -765,6 +765,14 @@ def paid_message(invite_link, package_name="VIP", invite_hours=24):
     )
 
 
+def paid_message_buttons(payment):
+    url = internal_telegram_chat_url(payment.get("vip_chat_id"))
+    if not url:
+        return None
+    package_name = (payment.get("package_name") or "VIP").strip() or "VIP"
+    return [[Button.url(f"Buka {package_name}", url)]]
+
+
 def invalid_payment_message():
     return (
         "⚠️ <b>QRIS sebelumnya sudah tidak aktif</b>\n\n"
