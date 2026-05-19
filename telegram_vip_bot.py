@@ -588,6 +588,16 @@ def telegram_user_link(user):
     return f'<a href="tg://user?id={user.id}">{name}</a>'
 
 
+def internal_telegram_chat_url(chat_id):
+    raw = str(chat_id or "").strip()
+    if not raw.startswith("-100"):
+        return ""
+    internal_id = raw[4:]
+    if not internal_id.isdigit():
+        return ""
+    return f"https://t.me/c/{internal_id}"
+
+
 def is_admin(config, user_id):
     return user_id in config.admin_user_ids
 
