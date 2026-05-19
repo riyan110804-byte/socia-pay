@@ -1139,6 +1139,7 @@ async def process_paid_payment(client, config, store, payment):
         ),
         parse_mode="html",
         link_preview=False,
+        buttons=paid_message_buttons(payment),
     )
     if delivery_status != "sent":
         if delivery_status == "blocked":
