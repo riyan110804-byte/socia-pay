@@ -706,12 +706,12 @@ def qris_caption(package, inv_id, checkout_amount, final_amount, expires):
         "",
         f"Kode pesanan: <code>{public_invoice}</code>",
         f"Paket: <b>{html.escape(package['name'])}</b>",
-        f"Nominal paket: <b>{format_rupiah(checkout_amount)}</b>",
+        f"Nominal paket: <code>{format_rupiah(checkout_amount)}</code>",
     ]
     if final_amount:
-        lines.append(f"Nominal QRIS: <b>{html.escape(final_amount)}</b>")
+        lines.append(f"Nominal QRIS: <code>{html.escape(final_amount)}</code>")
     if human_expires:
-        lines.append(f"⏳ Batas bayar: <b>{human_expires}</b>")
+        lines.append(f"⏳ Batas bayar: <code>{human_expires}</code>")
     lines.extend(
         [
             "",
@@ -735,12 +735,12 @@ def custom_qris_caption(inv_id, checkout_amount, final_amount, expires, user):
         "",
         f"Kode pesanan: <code>{public_invoice}</code>",
         f"Requester: {telegram_user_link(user)} (<code>{user.id}</code>)",
-        f"Nominal custom: <b>{format_rupiah(checkout_amount)}</b>",
+        f"Nominal custom: <code>{format_rupiah(checkout_amount)}</code>",
     ]
     if final_amount:
-        lines.append(f"Nominal QRIS: <b>{html.escape(final_amount)}</b>")
+        lines.append(f"Nominal QRIS: <code>{html.escape(final_amount)}</code>")
     if human_expires:
-        lines.append(f"⏳ Batas bayar: <b>{human_expires}</b>")
+        lines.append(f"⏳ Batas bayar: <code>{human_expires}</code>")
     lines.extend(
         [
             "",
@@ -759,7 +759,7 @@ def paid_message(invite_link, package_name="VIP", invite_hours=24):
         "✅ <b>Pembayaran berhasil terdeteksi</b>\n\n"
         f"Akses <b>{safe_package_name}</b> kamu sudah aktif.\n\n"
         "1️⃣ Join group lewat link ini dulu:\n"
-        f"{html.escape(invite_link)}\n\n"
+        f"<code>{html.escape(invite_link)}</code>\n\n"
         "2️⃣ Setelah sudah join, buka group lagi lewat tombol di bawah.\n\n"
         f"⚠️ Link join hanya bisa dipakai <b>1 kali</b> dan berlaku <b>{int(invite_hours)} jam</b>."
     )
