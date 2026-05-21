@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from telegram_vip_bot import (
     format_referral_code,
     main_menu_keyboard_text,
+    main_menu_button_labels,
     paid_message,
     referral_user_log_text,
     parse_referral_payload,
@@ -68,6 +69,9 @@ class ReferralWithdrawalTest(unittest.TestCase):
         text = main_menu_keyboard_text(user)
         self.assertEqual(text, "Hi Budi, Welcome di Bot Payment @boboinaja.")
         self.assertNotIn("Menu tersedia", text)
+
+    def test_main_menu_button_labels_include_buy_profile_and_withdrawal(self):
+        self.assertEqual(main_menu_button_labels(), ["🛒 Beli Group VIP", "👤 Profile", "💰 Tarik Saldo"])
 
     def test_referral_user_log_text_includes_name_username_profile_and_id(self):
         text = referral_user_log_text({"user_id": 1007265448, "full_name": "Neal Troy", "username": "nealmtroy"})

@@ -751,8 +751,13 @@ def withdrawal_details_text(raw):
     return fields
 
 
+def main_menu_button_labels():
+    return ["🛒 Beli Group VIP", "👤 Profile", "💰 Tarik Saldo"]
+
+
 def main_menu_buttons():
-    return [[Button.text("Profile", resize=True), Button.text("Tarik Saldo", resize=True)]]
+    buy_label, profile_label, withdrawal_label = main_menu_button_labels()
+    return [[Button.text(buy_label, resize=True)], [Button.text(profile_label, resize=True), Button.text(withdrawal_label, resize=True)]]
 
 
 def main_menu_keyboard_text(user):
@@ -1879,6 +1884,12 @@ async def main():
     async def buy_command(event):
         await send_package_menu(event, config, store)
 
+    @client.on(events.NewMessage(pattern=r"^🛒 Beli Group VIP$"))
+    @private_only
+    async def buy_button(event):
+        withdrawal_states.pop(event.sender_id, None)
+        await send_package_menu(event, config, store)
+
     @client.on(events.CallbackQuery(data=b"buy_vip"))
     async def buy_callback(event):
         if not event.is_private:
@@ -1915,13 +1926,13 @@ async def main():
         else:
             await event.respond("Tidak ada pembayaran pending.")
 
-    @client.on(events.NewMessage(pattern=r"^Profile$"))
+    @client.on(events.NewMessage(pattern=r"^👤 Profile$"))
     @private_only
     async def profile_button(event):
         withdrawal_states.pop(event.sender_id, None)
         await send_profile(event, config, store)
 
-    @client.on(events.NewMessage(pattern=r"^Tarik Saldo$"))
+    @client.on(events.NewMessage(pattern=r"^💰 Tarik Saldo$"))
     @private_only
     async def withdrawal_button(event):
         withdrawal_states.pop(event.sender_id, None)
@@ -1943,7 +1954,7 @@ async def main():
         if not state:
             return
         text = (event.raw_text or "").strip()
-        if text in {"Profile", "Tarik Saldo"} or text.startswith("/"):
+        if text in set(main_menu_button_labels()) or text.startswith("/"):
             withdrawal_states.pop(event.sender_id, None)
             return
         try:
