@@ -1006,14 +1006,17 @@ def custom_qris_caption(inv_id, checkout_amount, final_amount, expires, user):
     return "\n".join(lines)
 
 
-def paid_message(invite_link, package_name="VIP", invite_hours=24):
+def paid_message(invite_link, package_name="VIP", invite_hours=24, group_url=""):
     safe_package_name = html.escape(package_name)
+    safe_group_url = html.escape(group_url or "")
+    group_link = f'<a href="{safe_group_url}">Buka {safe_package_name}</a>' if safe_group_url else f"Buka {safe_package_name}"
     return (
         "✅ <b>Pembayaran berhasil terdeteksi</b>\n\n"
         f"Akses <b>{safe_package_name}</b> kamu sudah aktif.\n\n"
         "1️⃣ Join group lewat link ini dulu:\n"
         f"{html.escape(invite_link)}\n\n"
-        "2️⃣ Setelah sudah join, buka group lagi lewat tombol di bawah.\n\n"
+        "2️⃣ Setelah sudah join, buka group lagi lewat link ini:\n"
+        f"{group_link}\n\n"
         f"⚠️ Link join hanya bisa dipakai <b>1 kali</b> dan berlaku <b>{int(invite_hours)} jam</b>."
     )
 
@@ -1432,10 +1435,10 @@ async def process_paid_payment(client, config, store, payment):
             invite_link,
             payment.get("package_name") or "VIP",
             int(payment.get("invite_expire_hours") or 0) or config.invite_expire_hours,
+            internal_telegram_chat_url(payment.get("vip_chat_id")),
         ),
         parse_mode="html",
         link_preview=False,
-        buttons=paid_message_buttons(payment),
     )
     if delivery_status != "sent":
         if delivery_status == "blocked":

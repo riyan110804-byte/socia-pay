@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from telegram_vip_bot import (
     format_referral_code,
     main_menu_keyboard_text,
+    paid_message,
     referral_user_log_text,
     parse_referral_payload,
     parse_withdrawal_amount,
@@ -77,6 +78,16 @@ class ReferralWithdrawalTest(unittest.TestCase):
 
     def test_internal_telegram_chat_url_opens_first_post(self):
         self.assertEqual(internal_telegram_chat_url(-1003906637568), "https://t.me/c/3906637568/4")
+
+    def test_paid_message_uses_package_specific_clickable_group_link(self):
+        text = paid_message(
+            "https://t.me/+invite",
+            package_name="Group A",
+            invite_hours=24,
+            group_url="https://t.me/c/3906637568/4",
+        )
+        self.assertIn('<a href="https://t.me/c/3906637568/4">Buka Group A</a>', text)
+        self.assertNotIn("tombol di bawah", text)
 
 
 if __name__ == "__main__":
