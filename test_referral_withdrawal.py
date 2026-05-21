@@ -4,8 +4,10 @@ from types import SimpleNamespace
 from telegram_vip_bot import (
     format_referral_code,
     main_menu_keyboard_text,
+    referral_user_log_text,
     parse_referral_payload,
     parse_withdrawal_amount,
+    internal_telegram_chat_url,
     referral_commission,
     should_create_referral,
     updated_referral_counters,
@@ -65,6 +67,16 @@ class ReferralWithdrawalTest(unittest.TestCase):
         text = main_menu_keyboard_text(user)
         self.assertEqual(text, "Hi Budi, Welcome di Bot Payment @boboinaja.")
         self.assertNotIn("Menu tersedia", text)
+
+    def test_referral_user_log_text_includes_name_username_profile_and_id(self):
+        text = referral_user_log_text({"user_id": 1007265448, "full_name": "Neal Troy", "username": "nealmtroy"})
+        self.assertIn("Neal Troy", text)
+        self.assertIn("@nealmtroy", text)
+        self.assertIn('tg://user?id=1007265448', text)
+        self.assertIn("<code>1007265448</code>", text)
+
+    def test_internal_telegram_chat_url_opens_first_post(self):
+        self.assertEqual(internal_telegram_chat_url(-1003906637568), "https://t.me/c/3906637568/4")
 
 
 if __name__ == "__main__":

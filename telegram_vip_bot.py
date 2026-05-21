@@ -824,6 +824,14 @@ def user_link(row):
     return f'<a href="tg://user?id={row["user_id"]}">{name}</a>'
 
 
+def referral_user_log_text(row):
+    user_id = int(row["user_id"])
+    name = html.escape(row.get("full_name") or str(user_id))
+    username = (row.get("username") or "").strip()
+    username_line = f"\nUsername: @{html.escape(username)}" if username else ""
+    return f'<a href="tg://user?id={user_id}">{name}</a>{username_line}\nUser ID: <code>{user_id}</code>'
+
+
 def telegram_user_link(user):
     name = html.escape(display_name(user))
     return f'<a href="tg://user?id={user.id}">{name}</a>'
@@ -836,7 +844,7 @@ def internal_telegram_chat_url(chat_id):
     internal_id = raw[4:]
     if not internal_id.isdigit():
         return ""
-    return f"https://t.me/c/{internal_id}"
+    return f"https://t.me/c/{internal_id}/4"
 
 
 def is_admin(config, user_id):
@@ -1362,12 +1370,12 @@ async def credit_referral_if_needed(client, config, store, payment):
         config,
         store,
         (
-            "<b>Referral commission credited</b>\n"
-            f"Referrer: <code>{referral['referrer_user_id']}</code>\n"
-            f"Invited: {user_link(payment)} (<code>{payment['user_id']}</code>)\n"
+            "<b>Referral commission credited</b>\n\n"
+            f"<b>Yang Invite</b>\n{referral_user_log_text(store.get_user(referral['referrer_user_id']) or {'user_id': referral['referrer_user_id']})}\n\n"
+            f"<b>User yang Join</b>\n{user_link(payment)}\nUser ID: <code>{payment['user_id']}</code>\n\n"
             f"Invoice: <code>{html.escape(payment.get('public_invoice_id') or payment['inv_id'])}</code>\n"
-            f"Package amount: <code>{int(payment.get('package_amount') or 0)}</code>\n"
-            f"Commission: <code>{commission}</code>"
+            f"Package amount: <code>{format_rupiah(int(payment.get('package_amount') or 0))}</code>\n"
+            f"Commission: <code>{format_rupiah(commission)}</code>"
         ),
     )
 
@@ -1719,10 +1727,11 @@ async def handle_referral_start(event, config, store, payload):
             config,
             store,
             (
-                "<b>Referral joined</b>\n"
-                f"Referrer: <code>{referrer['user_id']}</code>\n"
-                f"Invited: {telegram_user_link(user)} (<code>{user.id}</code>)\n"
-                f"Code: <code>{html.escape(code)}</code>"
+                "<b>Referral joined</b>\n\n"
+                f"<b>Yang Invite</b>\n{referral_user_log_text(referrer)}\n\n"
+                f"<b>User yang Diundang</b>\n{telegram_user_link(user)}\nUser ID: <code>{user.id}</code>"
+                f"{f'\nUsername: @{html.escape(user.username)}' if user.username else ''}\n\n"
+                f"Referral code: <code>{html.escape(code)}</code>"
             ),
         )
     except Exception as exc:
