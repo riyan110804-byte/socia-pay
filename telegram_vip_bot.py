@@ -95,6 +95,9 @@ class Config:
     supabase_service_role_key: str
     supabase_table: str
     supabase_package_table: str
+    user_table: str
+    referral_table: str
+    withdrawal_table: str
 
 
 def env_required(name):
@@ -147,6 +150,9 @@ def load_config():
         supabase_service_role_key=env_required("SUPABASE_SERVICE_ROLE_KEY"),
         supabase_table=os.getenv("SUPABASE_TABLE", "vip_payments").strip() or "vip_payments",
         supabase_package_table=os.getenv("SUPABASE_PACKAGE_TABLE", "vip_packages").strip() or "vip_packages",
+        user_table=os.getenv("SUPABASE_USER_TABLE", "vip_users").strip() or "vip_users",
+        referral_table=os.getenv("SUPABASE_REFERRAL_TABLE", "vip_referrals").strip() or "vip_referrals",
+        withdrawal_table=os.getenv("SUPABASE_WITHDRAWAL_TABLE", "vip_withdrawals").strip() or "vip_withdrawals",
     )
 
 
@@ -154,6 +160,9 @@ class PaymentStore:
     def __init__(self, config):
         self.table = config.supabase_table
         self.package_table = config.supabase_package_table
+        self.user_table = config.user_table
+        self.referral_table = config.referral_table
+        self.withdrawal_table = config.withdrawal_table
         self.settings_table = os.getenv("SUPABASE_SETTINGS_TABLE", "vip_bot_settings").strip() or "vip_bot_settings"
         self.client = create_client(config.supabase_url, config.supabase_service_role_key)
         self.query_retries = max(1, env_int("SUPABASE_QUERY_RETRIES", 3))
@@ -191,6 +200,7 @@ class PaymentStore:
         qris_chat_id,
         qris_message_id,
         package=None,
+        referral=None,
     ):
         now = utc_now_iso()
         payload = qris_data.get("data", {})
@@ -223,6 +233,9 @@ class PaymentStore:
             "created_at": now,
             "updated_at": now,
         }
+        if referral:
+            data["referral_id"] = referral.get("id")
+            data["referrer_user_id"] = referral.get("referrer_user_id")
         self._execute(self.client.table(self.table).insert(data), "create payment")
 
     def ensure_payment_schema_ready(self):
@@ -430,6 +443,159 @@ class PaymentStore:
             return default
         return int(value)
 
+    def upsert_user(self, user):
+        existing = self.get_user(user.id)
+        code = existing.get("referral_code") if existing else format_referral_code(user.id)
+        data = {
+            "user_id": user.id,
+            "username": user.username or "",
+            "full_name": display_name(user),
+            "referral_code": code,
+            "updated_at": utc_now_iso(),
+        }
+        if not existing:
+            data.update(
+                {
+                    "balance": 0,
+                    "pending_referrals": 0,
+                    "successful_referrals": 0,
+                    "created_at": utc_now_iso(),
+                }
+            )
+        response = self._execute(self.client.table(self.user_table).upsert(data, on_conflict="user_id"), "upsert user")
+        return response.data[0] if response.data else {**(existing or {}), **data}
+
+    def get_user(self, user_id):
+        query = self.client.table(self.user_table).select("*").eq("user_id", int(user_id)).limit(1)
+        response = self._execute(query, "get user")
+        return response.data[0] if response.data else None
+
+    def get_user_by_referral_code(self, code):
+        query = self.client.table(self.user_table).select("*").eq("referral_code", code).limit(1)
+        response = self._execute(query, "get user by referral code")
+        return response.data[0] if response.data else None
+
+    def create_referral_if_absent(self, referrer, invited_user):
+        invited = self.upsert_user(invited_user)
+        if not should_create_referral(invited_user.id, referrer.get("user_id") if referrer else 0, invited.get("invited_by_user_id")):
+            return None, False
+        code = referrer["referral_code"]
+        data = {
+            "referrer_user_id": int(referrer["user_id"]),
+            "referrer_code": code,
+            "invited_user_id": invited_user.id,
+            "invited_username": invited_user.username or "",
+            "invited_full_name": display_name(invited_user),
+            "status": "pending",
+            "created_at": utc_now_iso(),
+            "updated_at": utc_now_iso(),
+        }
+        response = self._execute(self.client.table(self.referral_table).insert(data), "create referral")
+        referral = response.data[0] if response.data else data
+        self._execute(
+            self.client.table(self.user_table).update(
+                {"invited_by_user_id": int(referrer["user_id"]), "updated_at": utc_now_iso()}
+            ).eq("user_id", invited_user.id).is_("invited_by_user_id", "null"),
+            "set invited by user",
+        )
+        self._execute(
+            self.client.rpc("vip_increment_pending_referral", {"p_user_id": int(referrer["user_id"])}),
+            "increment pending referral",
+        )
+        return referral, True
+
+    def pending_referral_for_user(self, user_id):
+        query = self.client.table(self.referral_table).select("*").eq("invited_user_id", user_id).eq("status", "pending").limit(1)
+        response = self._execute(query, "get pending referral")
+        return response.data[0] if response.data else None
+
+    def referral_stats(self, user_id):
+        user = self.get_user(user_id) or {}
+        return {
+            "pending_count": int(user.get("pending_referrals") or 0),
+            "successful_count": int(user.get("successful_referrals") or 0),
+            "balance": int(user.get("balance") or 0),
+            "referral_code": user.get("referral_code") or format_referral_code(user_id),
+            "invited_by_user_id": user.get("invited_by_user_id"),
+            "phone": user.get("phone") or "",
+        }
+
+    def mark_referral_paid(self, referral_id, payment, commission):
+        query = self.client.table(self.referral_table).update(
+            {
+                "status": "paid",
+                "payment_inv_id": payment["inv_id"],
+                "package_code": payment.get("package_code") or "",
+                "package_amount": int(payment.get("package_amount") or 0),
+                "commission_amount": int(commission),
+                "updated_at": utc_now_iso(),
+            }
+        ).eq("id", referral_id).eq("status", "pending")
+        response = self._execute(query, "mark referral paid")
+        referral = response.data[0] if response.data else None
+        if referral:
+            self._execute(
+                self.client.rpc(
+                    "vip_credit_referral_commission",
+                    {"p_user_id": int(referral["referrer_user_id"]), "p_amount": int(commission)},
+                ),
+                "credit referral balance",
+            )
+        return referral
+
+    def create_withdrawal(self, user, amount, details):
+        data = {
+            "user_id": user.id,
+            "username": user.username or "",
+            "full_name": display_name(user),
+            "amount": int(amount),
+            "phone": details["phone"],
+            "wallet_name": details["wallet_name"],
+            "account_name": details["account_name"],
+            "status": "pending",
+            "created_at": utc_now_iso(),
+            "updated_at": utc_now_iso(),
+        }
+        response = self._execute(
+            self.client.rpc(
+                "vip_create_withdrawal",
+                {
+                    "p_user_id": user.id,
+                    "p_username": user.username or "",
+                    "p_full_name": display_name(user),
+                    "p_amount": int(amount),
+                    "p_phone": details["phone"],
+                    "p_wallet_name": details["wallet_name"],
+                    "p_account_name": details["account_name"],
+                },
+            ),
+            "create withdrawal",
+        )
+        if not response.data:
+            raise ValueError("Insufficient balance")
+        return response.data[0]
+
+    def get_withdrawal(self, withdrawal_id):
+        query = self.client.table(self.withdrawal_table).select("*").eq("id", int(withdrawal_id)).limit(1)
+        response = self._execute(query, "get withdrawal")
+        return response.data[0] if response.data else None
+
+    def update_withdrawal_status(self, withdrawal_id, from_status, to_status, admin_user_id):
+        query = self.client.table(self.withdrawal_table).update(
+            {"status": to_status, "admin_user_id": int(admin_user_id), "updated_at": utc_now_iso()}
+        ).eq("id", int(withdrawal_id)).eq("status", from_status)
+        response = self._execute(query, f"mark withdrawal {to_status}")
+        withdrawal = response.data[0] if response.data else None
+        if withdrawal and to_status == "rejected":
+            self._execute(
+                self.client.rpc(
+                    "vip_credit_balance",
+                    {"p_user_id": int(withdrawal["user_id"]), "p_amount": int(withdrawal.get("amount") or 0)},
+                ),
+                "refund rejected withdrawal",
+            )
+        return withdrawal
+
 
 def utc_now_iso():
     return dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat()
@@ -517,6 +683,75 @@ def format_rupiah(amount):
 
 def format_button_amount(amount):
     return f"{int(amount):,}".replace(",", ".")
+
+
+def format_referral_code(user_id):
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    value = (int(user_id) * 2654435761) & 0xFFFFFFFF
+    chars = []
+    for _ in range(6):
+        chars.append(alphabet[value % len(alphabet)])
+        value //= len(alphabet)
+    return "".join(chars).rstrip("A") or "A2345"
+
+
+def parse_referral_payload(payload):
+    raw = (payload or "").strip()
+    if raw.lower().startswith("ref_"):
+        raw = raw[4:]
+    raw = raw.upper()
+    if 5 <= len(raw) <= 6 and all(ch in string.ascii_uppercase + string.digits for ch in raw):
+        return raw
+    return ""
+
+
+def should_create_referral(invited_user_id, referrer_user_id, existing_referral):
+    return bool(referrer_user_id) and int(invited_user_id) != int(referrer_user_id) and not existing_referral
+
+
+def updated_referral_counters(user_row, commission):
+    return {
+        "balance": int(user_row.get("balance") or 0) + int(commission),
+        "pending_referrals": max(0, int(user_row.get("pending_referrals") or 0) - 1),
+        "successful_referrals": int(user_row.get("successful_referrals") or 0) + 1,
+    }
+
+
+def valid_withdrawal_amount(amount, balance):
+    return int(amount) > 0 and int(amount) <= int(balance)
+
+
+def referral_commission(payment):
+    return int(payment.get("package_amount") or 0) // 2
+
+
+def parse_withdrawal_amount(raw):
+    digits = "".join(ch for ch in (raw or "") if ch.isdigit())
+    return int(digits) if digits else 0
+
+
+def withdrawal_details_text(raw):
+    fields = {}
+    labels = {
+        "no hp": "phone",
+        "nama e-wallet": "wallet_name",
+        "atas nama": "account_name",
+    }
+    for line in (raw or "").splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        normalized = key.strip().lower()
+        if normalized in labels:
+            fields[labels[normalized]] = value.strip()
+    missing = [label for label, key in labels.items() if not fields.get(key)]
+    if missing:
+        raise ValueError("Format data penarikan belum lengkap.")
+    return fields
+
+
+def main_menu_buttons():
+    return [[Button.text("Profile", resize=True), Button.text("Tarik Saldo", resize=True)]]
 
 
 def normalize_package_code(code):
@@ -610,7 +845,7 @@ def runtime_log_chat_id(config, store):
     return store.get_int_setting("log_chat_id", config.log_chat_id)
 
 
-async def send_log(client, config, store, text):
+async def send_log(client, config, store, text, **kwargs):
     try:
         log_chat_id = runtime_log_chat_id(config, store)
     except Exception as exc:
@@ -619,7 +854,7 @@ async def send_log(client, config, store, text):
     if not log_chat_id:
         return
     try:
-        await client.send_message(log_chat_id, text, parse_mode="html", link_preview=False)
+        await client.send_message(log_chat_id, text, parse_mode="html", link_preview=False, **kwargs)
     except Exception as exc:
         LOGGER.warning("Failed to send log message to %s: %s", log_chat_id, exc)
 
@@ -819,6 +1054,7 @@ async def send_qris(event, config, store, qris_semaphore, user_locks, package=No
 
 
 async def send_qris_locked(event, config, store, qris_semaphore, user, package=None, invoice_message=None):
+    store.upsert_user(user)
     package = package or default_package(config, store)
     pending = store.latest_pending_for_user(user.id)
     if pending:
@@ -885,6 +1121,7 @@ async def send_qris_locked(event, config, store, qris_semaphore, user, package=N
             file=qr_file,
             parse_mode="html",
         )
+        referral = store.pending_referral_for_user(user.id)
         store.create_payment(
             user,
             buyer_invoice_id,
@@ -898,6 +1135,7 @@ async def send_qris_locked(event, config, store, qris_semaphore, user, package=N
             event.chat_id,
             invoice_message.id,
             package=package,
+            referral=referral,
         )
         await send_log(
             event.client,
@@ -1088,6 +1326,46 @@ async def send_custom_qris_locked(event, config, store, qris_semaphore, user, am
         await send_log(event.client, config, store, f"<b>Custom QRIS error</b>\n<code>{html.escape(str(exc))}</code>")
 
 
+async def credit_referral_if_needed(client, config, store, payment):
+    referral_id = payment.get("referral_id")
+    if not referral_id:
+        referral = store.pending_referral_for_user(payment["user_id"])
+        referral_id = referral.get("id") if referral else None
+    if not referral_id:
+        return
+    commission = referral_commission(payment)
+    if commission <= 0:
+        return
+    referral = store.mark_referral_paid(referral_id, payment, commission)
+    if not referral:
+        return
+    await safe_send_user(
+        client,
+        config,
+        store,
+        referral["referrer_user_id"],
+        (
+            "✅ <b>Komisi referral masuk</b>\n\n"
+            f"{html.escape(payment.get('full_name') or str(payment['user_id']))} sudah join member VIP.\n"
+            f"Komisi kamu: <b>{format_rupiah(commission)}</b>"
+        ),
+        parse_mode="html",
+    )
+    await send_log(
+        client,
+        config,
+        store,
+        (
+            "<b>Referral commission credited</b>\n"
+            f"Referrer: <code>{referral['referrer_user_id']}</code>\n"
+            f"Invited: {user_link(payment)} (<code>{payment['user_id']}</code>)\n"
+            f"Invoice: <code>{html.escape(payment.get('public_invoice_id') or payment['inv_id'])}</code>\n"
+            f"Package amount: <code>{int(payment.get('package_amount') or 0)}</code>\n"
+            f"Commission: <code>{commission}</code>"
+        ),
+    )
+
+
 async def process_paid_payment(client, config, store, payment):
     if payment["status"] == "delivery_error":
         if not store.claim_delivery_processing(payment["inv_id"]):
@@ -1166,6 +1444,8 @@ async def process_paid_payment(client, config, store, payment):
     changed = store.mark_paid(payment["inv_id"], invite_link, invite_expires_at)
     if not changed:
         return
+
+    await credit_referral_if_needed(client, config, store, payment)
 
     await send_log(
         client,
@@ -1406,6 +1686,122 @@ async def send_package_menu(event, config, store, text=None):
     )
 
 
+async def send_main_menu(event):
+    await event.respond("Menu tersedia di keyboard bawah.", buttons=main_menu_buttons())
+
+
+async def handle_referral_start(event, config, store, payload):
+    code = parse_referral_payload(payload)
+    if not code:
+        return
+    user = await event.get_sender()
+    if code == format_referral_code(user.id):
+        return
+    try:
+        referrer = store.get_user_by_referral_code(code)
+        if not referrer:
+            return
+        referral, created = store.create_referral_if_absent(referrer, user)
+        if not created:
+            return
+        await safe_send_user(
+            event.client,
+            config,
+            store,
+            referrer["user_id"],
+            f"✅ {html.escape(display_name(user))} berhasil diundang menggunakan referral link kamu.",
+            parse_mode="html",
+        )
+        await send_log(
+            event.client,
+            config,
+            store,
+            (
+                "<b>Referral joined</b>\n"
+                f"Referrer: <code>{referrer['user_id']}</code>\n"
+                f"Invited: {telegram_user_link(user)} (<code>{user.id}</code>)\n"
+                f"Code: <code>{html.escape(code)}</code>"
+            ),
+        )
+    except Exception as exc:
+        LOGGER.exception("Failed to process referral start")
+        await send_log(event.client, config, store, f"<b>Referral start error</b>\n<code>{html.escape(str(exc))}</code>")
+
+
+async def send_profile(event, config, store):
+    try:
+        user = await event.get_sender()
+        store.upsert_user(user)
+        stats = store.referral_stats(user.id)
+        me = await event.client.get_me()
+        code = stats["referral_code"]
+        link = f"https://t.me/{me.username}?start=ref_{code}" if me.username else f"ref_{code}"
+        lines = [
+            "<b>Profile</b>",
+            f"User ID: <code>{user.id}</code>",
+        ]
+        if user.username:
+            lines.append(f"Username: @{html.escape(user.username)}")
+        lines.extend(
+            [
+                f"Saldo: <b>{format_rupiah(stats['balance'])}</b>",
+                f"Referral link: {html.escape(link)}",
+                f"Referral Berhasil: <b>{stats['successful_count']}</b>",
+                f"Pending Referral: <b>{stats['pending_count']}</b>",
+            ]
+        )
+        await event.respond("\n".join(lines), parse_mode="html", buttons=main_menu_buttons())
+    except Exception as exc:
+        LOGGER.exception("Failed to show profile")
+        await event.respond("Profile belum bisa ditampilkan. Coba lagi beberapa saat lagi.", buttons=main_menu_buttons())
+        await send_log(event.client, config, store, f"<b>Profile error</b>\nUser: <code>{event.sender_id}</code>\n<code>{html.escape(str(exc))}</code>")
+
+
+async def send_withdrawal_menu(event, config, store):
+    try:
+        user = await event.get_sender()
+        store.upsert_user(user)
+        stats = store.referral_stats(event.sender_id)
+        await event.respond(
+            f"Saldo kamu: <b>{format_rupiah(stats['balance'])}</b>\n\nKlik tombol di bawah untuk tarik saldo.",
+            parse_mode="html",
+            buttons=[[Button.inline("Tarik Saldo", b"withdraw_start")]],
+        )
+    except Exception as exc:
+        LOGGER.exception("Failed to show withdrawal menu")
+        await event.respond("Menu tarik saldo belum bisa ditampilkan. Coba lagi beberapa saat lagi.")
+        await send_log(event.client, config, store, f"<b>Withdrawal menu error</b>\nUser: <code>{event.sender_id}</code>\n<code>{html.escape(str(exc))}</code>")
+
+
+async def create_withdrawal_request(event, config, store, user, amount, details):
+    stats = store.referral_stats(user.id)
+    if not valid_withdrawal_amount(amount, stats["balance"]):
+        await event.respond("Saldo kamu tidak cukup atau nominal penarikan tidak valid.")
+        return
+    withdrawal = store.create_withdrawal(user, amount, details)
+    await send_log(
+        event.client,
+        config,
+        store,
+        (
+            "<b>Withdrawal requested</b>\n"
+            f"ID: <code>{withdrawal.get('id')}</code>\n"
+            f"User: {telegram_user_link(user)} (<code>{user.id}</code>)\n"
+            f"Amount: <code>{amount}</code>\n"
+            f"No Hp: <code>{html.escape(details['phone'])}</code>\n"
+            f"Nama E-Wallet: <code>{html.escape(details['wallet_name'])}</code>\n"
+            f"Atas Nama: <code>{html.escape(details['account_name'])}</code>"
+        ),
+        buttons=[
+            [
+                Button.inline("Berhasil", f"withdraw_done:{withdrawal.get('id')}".encode()),
+                Button.inline("Tolak", f"withdraw_reject:{withdrawal.get('id')}".encode()),
+            ]
+        ],
+    )
+    await event.respond("Pengajuan penarikan saldo berhasil. Mohon tunggu 1x24 jam untuk diproses oleh admin.", buttons=main_menu_buttons())
+
+
 def parse_package_add_args(raw):
     raw = (raw or "").strip()
     if not raw or " " not in raw:
@@ -1448,9 +1844,15 @@ async def main():
     qris_semaphore = asyncio.Semaphore(config.qris_create_concurrency)
     user_locks = {}
 
-    @client.on(events.NewMessage(pattern=r"^/start$"))
+    withdrawal_states = {}
+
+    @client.on(events.NewMessage(pattern=r"^/start(?:\s+(.+))?$"))
     @private_only
     async def start(event):
+        user = await event.get_sender()
+        store.upsert_user(user)
+        await handle_referral_start(event, config, store, event.pattern_match.group(1) or "")
+        await send_main_menu(event)
         await send_package_menu(event, config, store)
 
     @client.on(events.NewMessage(pattern=r"^/buy$"))
@@ -1493,6 +1895,94 @@ async def main():
             )
         else:
             await event.respond("Tidak ada pembayaran pending.")
+
+    @client.on(events.NewMessage(pattern=r"^Profile$"))
+    @private_only
+    async def profile_button(event):
+        withdrawal_states.pop(event.sender_id, None)
+        await send_profile(event, config, store)
+
+    @client.on(events.NewMessage(pattern=r"^Tarik Saldo$"))
+    @private_only
+    async def withdrawal_button(event):
+        withdrawal_states.pop(event.sender_id, None)
+        await send_withdrawal_menu(event, config, store)
+
+    @client.on(events.CallbackQuery(data=b"withdraw_start"))
+    async def withdraw_start(event):
+        if not event.is_private:
+            await event.answer("Buka bot lewat private chat.", alert=True)
+            return
+        await event.answer()
+        withdrawal_states[event.sender_id] = {"step": "amount"}
+        await event.respond("Masukkan nominal yang mau ditarik. Contoh: 50.000 atau 50000")
+
+    @client.on(events.NewMessage)
+    @private_only
+    async def withdrawal_input(event):
+        state = withdrawal_states.get(event.sender_id)
+        if not state:
+            return
+        text = (event.raw_text or "").strip()
+        if text in {"Profile", "Tarik Saldo"} or text.startswith("/"):
+            withdrawal_states.pop(event.sender_id, None)
+            return
+        try:
+            if state["step"] == "amount":
+                amount = parse_withdrawal_amount(text)
+                user = await event.get_sender()
+                store.upsert_user(user)
+                stats = store.referral_stats(event.sender_id)
+                if not valid_withdrawal_amount(amount, stats["balance"]):
+                    await event.respond("Saldo kamu tidak cukup atau nominal penarikan tidak valid.")
+                    return
+                withdrawal_states[event.sender_id] = {"step": "details", "amount": amount}
+                await event.respond("Kirim data tujuan dengan format:\nNo Hp: 08123456789\nNama E-Wallet: Dana\nAtas Nama: Nama Kamu")
+                return
+            details = withdrawal_details_text(text)
+            user = await event.get_sender()
+            await create_withdrawal_request(event, config, store, user, state["amount"], details)
+            withdrawal_states.pop(event.sender_id, None)
+        except ValueError:
+            await event.respond("Format data belum lengkap. Gunakan:\nNo Hp: 08123456789\nNama E-Wallet: Dana\nAtas Nama: Nama Kamu")
+        except Exception as exc:
+            LOGGER.exception("Withdrawal input error")
+            withdrawal_states.pop(event.sender_id, None)
+            await event.respond("Pengajuan penarikan belum bisa diproses. Coba lagi beberapa saat lagi.", buttons=main_menu_buttons())
+            await send_log(event.client, config, store, f"<b>Withdrawal input error</b>\nUser: <code>{event.sender_id}</code>\n<code>{html.escape(str(exc))}</code>")
+
+    @client.on(events.CallbackQuery(pattern=rb"^withdraw_(done|reject):(\d+)$"))
+    async def withdrawal_admin_action(event):
+        if not is_admin(config, event.sender_id):
+            await event.answer("Khusus admin.", alert=True)
+            return
+        action = event.pattern_match.group(1).decode()
+        withdrawal_id = event.pattern_match.group(2).decode()
+        status = "completed" if action == "done" else "rejected"
+        label = "berhasil diproses" if action == "done" else "ditolak"
+        try:
+            withdrawal = store.update_withdrawal_status(withdrawal_id, "pending", status, event.sender_id)
+            if not withdrawal:
+                await event.answer("Pengajuan sudah diproses.", alert=True)
+                return
+            await event.answer(f"Withdrawal {label}.")
+            await safe_send_user(
+                event.client,
+                config,
+                store,
+                withdrawal["user_id"],
+                f"Pengajuan penarikan saldo {format_rupiah(withdrawal['amount'])} {label} oleh admin.",
+            )
+            message = await event.get_message()
+            await event.edit(
+                f"{message.raw_text}\n\nStatus: <b>{html.escape(status)}</b>\nAdmin: <code>{event.sender_id}</code>",
+                parse_mode="html",
+                buttons=None,
+            )
+        except Exception as exc:
+            LOGGER.exception("Withdrawal admin action error")
+            await event.answer("Gagal memproses withdrawal. Cek log.", alert=True)
+            await send_log(event.client, config, store, f"<b>Withdrawal admin action error</b>\nID: <code>{html.escape(withdrawal_id)}</code>\n<code>{html.escape(str(exc))}</code>")
 
     @client.on(events.NewMessage(pattern=r"^/chatid$"))
     async def chat_id(event):
@@ -1550,7 +2040,9 @@ async def main():
                 ),
             )
         except Exception as exc:
-            await event.respond(f"Gagal tambah paket: <code>{html.escape(str(exc))}</code>", parse_mode="html")
+            LOGGER.exception("Failed to add package")
+            await event.respond("Gagal tambah paket. Detail error dikirim ke log admin.")
+            await send_log(client, config, store, f"<b>Package add error</b>\nAdmin: <code>{event.sender_id}</code>\n<code>{html.escape(str(exc))}</code>")
 
     @client.on(events.NewMessage(pattern=r"^/package_list(?:@\w+)?$"))
     async def package_list(event):
@@ -1583,7 +2075,9 @@ async def main():
             else:
                 await event.respond("Paket tidak ditemukan atau sudah nonaktif.")
         except Exception as exc:
-            await event.respond(f"Gagal hapus paket: <code>{html.escape(str(exc))}</code>", parse_mode="html")
+            LOGGER.exception("Failed to delete package")
+            await event.respond("Gagal hapus paket. Detail error dikirim ke log admin.")
+            await send_log(client, config, store, f"<b>Package delete error</b>\nAdmin: <code>{event.sender_id}</code>\n<code>{html.escape(str(exc))}</code>")
 
     @client.on(events.NewMessage(pattern=r"^/setvip(?:\s+(.+))?$"))
     async def set_vip(event):
@@ -1599,7 +2093,9 @@ async def main():
             await event.respond(f"VIP chat diset ke `{chat_id_value}`.")
             await send_log(client, config, store, f"<b>Config updated</b>\n<code>vip_chat_id={chat_id_value}</code>")
         except Exception as exc:
-            await event.respond(f"Gagal set VIP chat: `{html.escape(str(exc))}`")
+            LOGGER.exception("Failed to set VIP chat")
+            await event.respond("Gagal set VIP chat. Detail error dikirim ke log admin.")
+            await send_log(client, config, store, f"<b>Set VIP chat error</b>\nAdmin: <code>{event.sender_id}</code>\n<code>{html.escape(str(exc))}</code>")
 
     @client.on(events.NewMessage(pattern=r"^/setlog(?:\s+(.+))?$"))
     async def set_log(event):
@@ -1615,7 +2111,9 @@ async def main():
             await event.respond(f"Log chat diset ke `{chat_id_value}`.")
             await send_log(client, config, store, f"<b>Config updated</b>\n<code>log_chat_id={chat_id_value}</code>")
         except Exception as exc:
-            await event.respond(f"Gagal set log chat: `{html.escape(str(exc))}`")
+            LOGGER.exception("Failed to set log chat")
+            await event.respond("Gagal set log chat. Detail error dikirim ke log admin.")
+            await send_log(client, config, store, f"<b>Set log chat error</b>\nAdmin: <code>{event.sender_id}</code>\n<code>{html.escape(str(exc))}</code>")
 
     @client.on(events.NewMessage(pattern=r"^/config$"))
     async def show_config(event):

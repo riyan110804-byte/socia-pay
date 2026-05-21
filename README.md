@@ -64,6 +64,8 @@ python telegram_vip_bot.py
 
 User DM bot lalu `/start`, pilih paket seperti `group a - 5.000`, message tombol akan berubah menjadi invoice QRIS. Nominal checkout mengikuti paket yang dipilih. Setelah pembayaran terdeteksi, bot menghapus QRIS dan mengirim invite link ke group paket tersebut. Kalau pembayaran gagal/expired/tidak valid, bot juga menghapus QRIS supaya tidak terscan lagi. Invite link berlaku sesuai `INVITE_EXPIRE_HOURS` dan hanya bisa dipakai 1 kali. Log transaksi menyimpan paket, kode pesanan internal, kode pesanan user, nominal checkout, nominal QRIS, dan invite link yang dikirim.
 
+Bot juga menampilkan reply keyboard `Profile` dan `Tarik Saldo`. Semua user otomatis disimpan di `vip_users` saat berinteraksi dengan bot, jadi referral link 5-6 digit langsung aktif tanpa perlu membuka Profile dulu. `Profile` berisi saldo referral, referral berhasil, link referral, dan jumlah pending referral. Komisi referral adalah 50% dari `package_amount` setelah user undangan berhasil membayar paket VIP. Pengajuan tarik saldo dikirim ke `LOG_CHAT_ID` dengan tombol admin `Berhasil` dan `Tolak`.
+
 Kalau database sudah pernah dibuat sebelum versi ini, jalankan ulang isi `supabase_schema.sql` di SQL Editor supaya tabel `vip_packages`, kolom paket payment, status recovery production, dan kolom adaptive polling ikut aktif.
 
 Bot membatasi pembuatan QRIS bersamaan lewat `QRIS_CREATE_CONCURRENCY` supaya traffic ramai tetap antre rapi. Default `5` cukup aman untuk awal; naikkan pelan-pelan kalau SociaBuzz tetap stabil.
@@ -88,6 +90,9 @@ Set variables ini di Railway:
 - `SUPABASE_TABLE=vip_payments`
 - `SUPABASE_SETTINGS_TABLE=vip_bot_settings`
 - `SUPABASE_PACKAGE_TABLE=vip_packages`
+- `SUPABASE_USER_TABLE=vip_users`
+- `SUPABASE_REFERRAL_TABLE=vip_referrals`
+- `SUPABASE_WITHDRAWAL_TABLE=vip_withdrawals`
 - `SUPABASE_QUERY_RETRIES=3`
 - `SUPABASE_RETRY_BASE_DELAY=0.35`
 - `ADMIN_USER_IDS`
