@@ -54,6 +54,10 @@ class ReferralWithdrawalTest(unittest.TestCase):
         self.assertFalse(valid_withdrawal_amount(50001, 50000))
         self.assertFalse(valid_withdrawal_amount(0, 50000))
 
+    def test_withdrawal_amount_minimum_is_ten_thousand(self):
+        self.assertTrue(valid_withdrawal_amount(10000, 10000))
+        self.assertFalse(valid_withdrawal_amount(9999, 10000))
+
 
 if __name__ == "__main__":
     unittest.main()

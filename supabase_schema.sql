@@ -342,7 +342,7 @@ AS $$
 DECLARE
     created public.vip_withdrawals;
 BEGIN
-    IF p_amount <= 0 THEN
+    IF p_amount < 10000 THEN
         RETURN;
     END IF;
 

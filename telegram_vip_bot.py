@@ -73,6 +73,7 @@ LAST_NAMES = [
 
 ACTIVE_PAYMENT_STATUSES = ("pending", "processing_paid", "invite_error", "delivery_error", "processing_delivery")
 RETRYABLE_PAYMENT_STATUSES = ("pending", "invite_error", "delivery_error")
+MIN_WITHDRAWAL_AMOUNT = 10_000
 
 
 @dataclass(frozen=True)
@@ -718,7 +719,7 @@ def updated_referral_counters(user_row, commission):
 
 
 def valid_withdrawal_amount(amount, balance):
-    return int(amount) > 0 and int(amount) <= int(balance)
+    return int(amount) >= MIN_WITHDRAWAL_AMOUNT and int(amount) <= int(balance)
 
 
 def referral_commission(payment):
@@ -1673,7 +1674,7 @@ async def require_log_chat(event, config, store):
     return False
 
 
-async def send_package_menu(event, config, store, text=None):
+async def send_package_menu(event, config, store, text=None, buttons=None):
     await event.respond(
         text
         or (
@@ -1681,13 +1682,9 @@ async def send_package_menu(event, config, store, text=None):
             "Pilih group VIP yang mau kamu akses. Pembayaran pakai QRIS, dicek otomatis, "
             "dan link VIP dikirim langsung setelah berhasil."
         ),
-        buttons=package_buttons(config, store),
+        buttons=buttons or package_buttons(config, store),
         parse_mode="html",
     )
-
-
-async def send_main_menu(event):
-    await event.respond("Menu tersedia di keyboard bawah.", buttons=main_menu_buttons())
 
 
 async def handle_referral_start(event, config, store, payload):
@@ -1736,20 +1733,25 @@ async def send_profile(event, config, store):
         me = await event.client.get_me()
         code = stats["referral_code"]
         link = f"https://t.me/{me.username}?start=ref_{code}" if me.username else f"ref_{code}"
-        lines = [
-            "<b>Profile</b>",
-            f"User ID: <code>{user.id}</code>",
+        detail_lines = [
+            f"<b>User ID</b>: <code>{user.id}</code>",
         ]
         if user.username:
-            lines.append(f"Username: @{html.escape(user.username)}")
-        lines.extend(
+            detail_lines.append(f"<b>Username</b>: @{html.escape(user.username)}")
+        detail_lines.extend(
             [
-                f"Saldo: <b>{format_rupiah(stats['balance'])}</b>",
-                f"Referral link: {html.escape(link)}",
-                f"Referral Berhasil: <b>{stats['successful_count']}</b>",
-                f"Pending Referral: <b>{stats['pending_count']}</b>",
+                f"<b>Saldo</b>: <b>{format_rupiah(stats['balance'])}</b>",
+                f"<b>Referral link</b>: {html.escape(link)}",
+                f"<b>Referral Berhasil</b>: <b>{stats['successful_count']}</b>",
+                f"<b>Pending Referral</b>: <b>{stats['pending_count']}</b>",
             ]
         )
+        lines = [
+            "<b>Profile</b>",
+            "Dapatkan komisi sebesar <b>50%</b> dari setiap pembelian paket VIP melalui referral link kamu.",
+            "",
+            f"<blockquote>{'\n'.join(detail_lines)}</blockquote>",
+        ]
         await event.respond("\n".join(lines), parse_mode="html", buttons=main_menu_buttons())
     except Exception as exc:
         LOGGER.exception("Failed to show profile")
@@ -1776,7 +1778,7 @@ async def send_withdrawal_menu(event, config, store):
 async def create_withdrawal_request(event, config, store, user, amount, details):
     stats = store.referral_stats(user.id)
     if not valid_withdrawal_amount(amount, stats["balance"]):
-        await event.respond("Saldo kamu tidak cukup atau nominal penarikan tidak valid.")
+        await event.respond("Minimal penarikan saldo adalah Rp10.000 dan saldo kamu harus mencukupi.")
         return
     withdrawal = store.create_withdrawal(user, amount, details)
     await send_log(
@@ -1852,7 +1854,6 @@ async def main():
         user = await event.get_sender()
         store.upsert_user(user)
         await handle_referral_start(event, config, store, event.pattern_match.group(1) or "")
-        await send_main_menu(event)
         await send_package_menu(event, config, store)
 
     @client.on(events.NewMessage(pattern=r"^/buy$"))
@@ -1915,7 +1916,7 @@ async def main():
             return
         await event.answer()
         withdrawal_states[event.sender_id] = {"step": "amount"}
-        await event.respond("Masukkan nominal yang mau ditarik. Contoh: 50.000 atau 50000")
+        await event.respond("Masukkan nominal yang mau ditarik. Minimal Rp10.000. Contoh: 50.000 atau 50000")
 
     @client.on(events.NewMessage)
     @private_only
@@ -1934,7 +1935,7 @@ async def main():
                 store.upsert_user(user)
                 stats = store.referral_stats(event.sender_id)
                 if not valid_withdrawal_amount(amount, stats["balance"]):
-                    await event.respond("Saldo kamu tidak cukup atau nominal penarikan tidak valid.")
+                    await event.respond("Minimal penarikan saldo adalah Rp10.000 dan saldo kamu harus mencukupi.")
                     return
                 withdrawal_states[event.sender_id] = {"step": "details", "amount": amount}
                 await event.respond("Kirim data tujuan dengan format:\nNo Hp: 08123456789\nNama E-Wallet: Dana\nAtas Nama: Nama Kamu")
