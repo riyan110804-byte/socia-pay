@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 
 from telegram_vip_bot import (
     format_referral_code,
@@ -59,9 +60,11 @@ class ReferralWithdrawalTest(unittest.TestCase):
         self.assertTrue(valid_withdrawal_amount(10000, 10000))
         self.assertFalse(valid_withdrawal_amount(9999, 10000))
 
-    def test_main_menu_keyboard_text_has_no_visible_menu_copy(self):
-        self.assertNotIn("Menu tersedia", main_menu_keyboard_text())
-        self.assertTrue(main_menu_keyboard_text())
+    def test_main_menu_keyboard_text_greets_user(self):
+        user = SimpleNamespace(first_name="Budi", last_name="", username="budi")
+        text = main_menu_keyboard_text(user)
+        self.assertEqual(text, "Hi Budi, Welcome di Bot Payment @boboinaja.")
+        self.assertNotIn("Menu tersedia", text)
 
 
 if __name__ == "__main__":

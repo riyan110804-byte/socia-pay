@@ -755,8 +755,9 @@ def main_menu_buttons():
     return [[Button.text("Profile", resize=True), Button.text("Tarik Saldo", resize=True)]]
 
 
-def main_menu_keyboard_text():
-    return "⁠"
+def main_menu_keyboard_text(user):
+    name = display_name(user) or "kak"
+    return f"Hi {html.escape(name)}, Welcome di Bot Payment @boboinaja."
 
 
 def normalize_package_code(code):
@@ -1858,7 +1859,7 @@ async def main():
         user = await event.get_sender()
         store.upsert_user(user)
         await handle_referral_start(event, config, store, event.pattern_match.group(1) or "")
-        await event.respond(main_menu_keyboard_text(), buttons=main_menu_buttons())
+        await event.respond(main_menu_keyboard_text(user), buttons=main_menu_buttons(), parse_mode="html")
         await send_package_menu(event, config, store)
 
     @client.on(events.NewMessage(pattern=r"^/buy$"))
