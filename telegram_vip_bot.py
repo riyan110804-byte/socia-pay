@@ -755,6 +755,10 @@ def main_menu_buttons():
     return [[Button.text("Profile", resize=True), Button.text("Tarik Saldo", resize=True)]]
 
 
+def main_menu_keyboard_text():
+    return "⁠"
+
+
 def normalize_package_code(code):
     normalized = (code or "").strip().lower()
     if not normalized:
@@ -1854,6 +1858,7 @@ async def main():
         user = await event.get_sender()
         store.upsert_user(user)
         await handle_referral_start(event, config, store, event.pattern_match.group(1) or "")
+        await event.respond(main_menu_keyboard_text(), buttons=main_menu_buttons())
         await send_package_menu(event, config, store)
 
     @client.on(events.NewMessage(pattern=r"^/buy$"))

@@ -2,6 +2,7 @@ import unittest
 
 from telegram_vip_bot import (
     format_referral_code,
+    main_menu_keyboard_text,
     parse_referral_payload,
     parse_withdrawal_amount,
     referral_commission,
@@ -57,6 +58,10 @@ class ReferralWithdrawalTest(unittest.TestCase):
     def test_withdrawal_amount_minimum_is_ten_thousand(self):
         self.assertTrue(valid_withdrawal_amount(10000, 10000))
         self.assertFalse(valid_withdrawal_amount(9999, 10000))
+
+    def test_main_menu_keyboard_text_has_no_visible_menu_copy(self):
+        self.assertNotIn("Menu tersedia", main_menu_keyboard_text())
+        self.assertTrue(main_menu_keyboard_text())
 
 
 if __name__ == "__main__":
