@@ -1047,7 +1047,7 @@ def qris_caption(package, inv_id, checkout_amount, final_amount, expires):
     if human_expires:
         detail_lines.append(f"<b>⏳ Batas Bayar</b>: {human_expires}")
     lines = [
-        f"🔥 <b>Akses {package_name}</b>",
+        f"<b>Akses {package_name}</b>",
         "",
         f"<blockquote>{'\n'.join(detail_lines)}</blockquote>",
         "",
@@ -1066,8 +1066,8 @@ def custom_qris_caption(inv_id, checkout_amount, final_amount, expires, user):
     public_invoice = html.escape(inv_id)
     human_expires = format_custom_qris_expiry(expires) if expires else ""
     detail_lines = [
-        f"<b>Kode Pesanan</b>: {public_invoice}",
-        f"<b>Requester</b>: {telegram_user_link(user)} ({user.id})",
+        f"<b>Kode Pesanan</b>: <code>{public_invoice}</code>",
+        f"<b>Requester</b>: {telegram_user_link(user)} (<code>{user.id}</code>)",
         f"<b>Nominal Custom</b>: {format_rupiah(checkout_amount)}",
     ]
     if final_amount:
@@ -1242,14 +1242,14 @@ async def send_qris_locked(event, config, store, qris_semaphore, user, package=N
             (
                 "<b>QRIS CREATED</b>\n\n"
                 "<blockquote>"
-                f"<b>User</b>: {telegram_user_link(user)} ({user.id})\n"
-                f"<b>Package</b>: {html.escape(package.get('code') or '')} {html.escape(package.get('name') or '')} ({package.get('vip_chat_id') or ''})\n"
+                f"<b>User</b>: {telegram_user_link(user)} (<code>{user.id}</code>)\n"
+                f"<b>Package</b>: {html.escape(package.get('code') or '')} {html.escape(package.get('name') or '')} (<code>{package.get('vip_chat_id') or ''}</code>)\n"
                 f"<b>Package Amount</b>: {format_button_amount(checkout_amount)}\n"
                 f"<b>QRIS Amount</b>: {html.escape(payload.get('amount') or '')}\n"
-                f"<b>Invoice</b>: {html.escape(buyer_invoice_id)}\n"
-                f"<b>Internal Invoice</b>: {html.escape(socia_invoice_id)}\n"
+                f"<b>Invoice</b>: <code>{html.escape(buyer_invoice_id)}</code>\n"
+                f"<b>Internal Invoice</b>: <code>{html.escape(socia_invoice_id)}</code>\n"
                 f"<b>Source Payment</b>: {html.escape(qris.get('source_payment') or '')}\n"
-                f"<b>Order ID</b>: {html.escape(order_id)}"
+                f"<b>Order ID</b>: <code>{html.escape(order_id)}</code>"
                 "</blockquote>"
             ),
         )
@@ -1396,13 +1396,13 @@ async def send_custom_qris_locked(event, config, store, qris_semaphore, user, am
             (
                 "<b>Custom QRIS CREATED</b>\n\n"
                 "<blockquote>"
-                f"<b>User</b>: {telegram_user_link(user)} ({user.id})\n"
+                f"<b>User</b>: {telegram_user_link(user)} (<code>{user.id}</code>)\n"
                 f"<b>Custom QRIS Amount</b>: {format_rupiah(checkout_amount)}\n"
                 f"<b>QRIS Amount</b>: {html.escape(payload.get('amount') or '')}\n"
-                f"<b>Invoice</b>: {html.escape(buyer_invoice_id)}\n"
-                f"<b>Internal Invoice</b>: {html.escape(socia_invoice_id)}\n"
+                f"<b>Invoice</b>: <code>{html.escape(buyer_invoice_id)}</code>\n"
+                f"<b>Internal Invoice</b>: <code>{html.escape(socia_invoice_id)}</code>\n"
                 f"<b>Source Payment</b>: {html.escape(qris.get('source_payment') or '')}\n"
-                f"<b>Order ID</b>: {html.escape(order_id)}"
+                f"<b>Order ID</b>: <code>{html.escape(order_id)}</code>"
                 "</blockquote>"
             ),
         )
@@ -1501,16 +1501,16 @@ async def credit_referral_if_needed(client, config, store, payment):
             "<b>INVITER</b>\n"
             f"<b>Name</b>: {html.escape(referrer_row.get('full_name') or str(referrer_row.get('user_id')))}\n"
             f"<b>Username</b>: {('@' + html.escape(referrer_row.get('username'))) if referrer_row.get('username') else '-'}\n"
-            f"<b>User ID</b>: {referrer_row.get('user_id')}"
+            f"<b>User ID</b>: <code>{referrer_row.get('user_id')}</code>"
             "</blockquote>\n\n"
             "<blockquote>"
             "<b>USER INVITED</b>\n"
             f"<b>Name</b>: {html.escape(payment.get('full_name') or str(payment['user_id']))}\n"
-            f"<b>User ID</b>: {payment['user_id']}"
+            f"<b>User ID</b>: <code>{payment['user_id']}</code>"
             "</blockquote>\n\n"
             "<blockquote>"
             "<b>TRANSACTION</b>\n"
-            f"<b>Invoice</b>: {html.escape(payment.get('public_invoice_id') or payment['inv_id'])}\n"
+            f"<b>Invoice</b>: <code>{html.escape(payment.get('public_invoice_id') or payment['inv_id'])}</code>\n"
             f"<b>Package</b>: {html.escape(payment.get('package_code') or '')} {html.escape(payment.get('package_name') or '')}\n"
             f"<b>Package Amount</b>: {format_rupiah(int(payment.get('package_amount') or 0))}\n"
             f"<b>Commission</b>: {format_rupiah(commission)}\n\n"
@@ -1610,9 +1610,9 @@ async def process_paid_payment(client, config, store, payment):
         (
             "<b>PAYMENT PAID</b>\n\n"
             "<blockquote>"
-            f"<b>User</b>: {user_link(payment)} ({payment['user_id']})\n"
+            f"<b>User</b>: {user_link(payment)} (<code>{payment['user_id']}</code>)\n"
             f"<b>Package</b>: {html.escape(payment.get('package_code') or '')} {html.escape(payment.get('package_name') or '')}\n"
-            f"<b>Invoice</b>: {html.escape(payment.get('public_invoice_id') or payment['inv_id'])}\n"
+            f"<b>Invoice</b>: <code>{html.escape(payment.get('public_invoice_id') or payment['inv_id'])}</code>\n"
             f"<b>Internal Invoice</b>: {html.escape(payment['inv_id'])}\n"
             f"<b>Invite Link</b>: {html.escape(invite_link)}\n"
             f"<b>Invite Link Expires</b>: {format_log_datetime(invite_expires_at)}"
@@ -1761,19 +1761,21 @@ async def expire_pending_payment(client, config, store, payment, title="Payment 
         log_text = (
             "<b>Custom QRIS Expired</b>\n\n"
             "<blockquote>"
-            f"<b>User</b>: {user_link(payment)} ({payment['user_id']})\n"
+            f"<b>User</b>: {user_link(payment)} (<code>{payment['user_id']}</code>)\n"
             f"<b>Custom QRIS Amount</b>: {format_rupiah(int(payment.get('amount') or 0))}\n"
-            f"<b>Invoice</b>: {html.escape(payment.get('public_invoice_id') or payment['inv_id'])}\n"
-            f"<b>Internal Invoice</b>: {html.escape(payment['inv_id'])}"
+            f"<b>Invoice</b>: <code>{html.escape(payment.get('public_invoice_id') or payment['inv_id'])}</code>\n"
+            f"<b>Internal Invoice</b>: <code>{html.escape(payment['inv_id'])}</code>"
             "</blockquote>"
         )
     else:
         log_text = (
-            f"<b>{html.escape(title)}</b>\n"
-            f"User: {user_link(payment)} ({payment['user_id']})\n"
-            f"Package: {html.escape(payment.get('package_code') or '')} {html.escape(payment.get('package_name') or '')}\n"
-            f"Invoice: {html.escape(payment.get('public_invoice_id') or payment['inv_id'])}\n"
-            f"Internal invoice: {html.escape(payment['inv_id'])}"
+            "<b>PAYMENT EXPIRED</b>\n\n"
+            "<blockquote>"
+            f"<b>User</b>: {user_link(payment)} (<code>{payment['user_id']}</code>)\n"
+            f"<b>Package</b>: {html.escape(payment.get('package_code') or '')} {html.escape(payment.get('package_name') or '')}\n"
+            f"<b>Invoice</b>: <code>{html.escape(payment.get('public_invoice_id') or payment['inv_id'])}</code>\n"
+            f"<b>Internal Invoice</b>: <code>{html.escape(payment['inv_id'])}</code>"
+            "</blockquote>"
         )
     await send_log(client, config, store, log_text)
 
