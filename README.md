@@ -56,6 +56,10 @@ Admin juga bisa membuat QRIS nominal bebas dari group/channel logging:
 
 Command `/custom` hanya diproses kalau dikirim oleh admin di `LOG_CHAT_ID`. QRIS custom akan muncul di chat logging dan statusnya tetap dicek otomatis.
 
+Broadcast admin juga hanya bisa dibuat dari `LOG_CHAT_ID`. Kirim pesan rich text/media di logging chat, reply pesan itu dengan `/set_broadcast`, lalu tes ke admin saja dengan `/test_broadcast`. Jadwal harian bisa diaktifkan dengan `/set_broadcasttime HH:MM` (WIB) dan dimatikan dengan `/set_broadcasttime off`. Broadcast harian dikirim ke user non-bot dengan batch `BROADCAST_BATCH_SIZE`, dimulai dari user yang paling lama belum menerima broadcast.
+
+Gunakan `/commands` atau `/command` di `LOG_CHAT_ID` untuk melihat daftar command admin. Command admin yang dikirim langsung ke bot di DM tidak akan dibalas.
+
 ## Run
 
 ```powershell
@@ -93,6 +97,7 @@ Set variables ini di Railway:
 - `SUPABASE_USER_TABLE=vip_users`
 - `SUPABASE_REFERRAL_TABLE=vip_referrals`
 - `SUPABASE_WITHDRAWAL_TABLE=vip_withdrawals`
+- `SUPABASE_BROADCAST_TABLE=vip_broadcast_messages`
 - `SUPABASE_QUERY_RETRIES=3`
 - `SUPABASE_RETRY_BASE_DELAY=0.35`
 - `ADMIN_USER_IDS`
@@ -102,6 +107,7 @@ Set variables ini di Railway:
 - `POLL_INTERVAL_SECONDS=3`
 - `POLL_MAX_ATTEMPTS=300`
 - `POLL_BATCH_SIZE=20`
+- `BROADCAST_BATCH_SIZE=20`
 - `QRIS_CREATE_CONCURRENCY=5`
 
 State invoice disimpan di Supabase, jadi Railway tidak perlu Volume. Gunakan `service_role` key hanya di Railway Variables, jangan taruh di frontend atau repo.

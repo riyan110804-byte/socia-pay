@@ -1,7 +1,11 @@
 import unittest
 from types import SimpleNamespace
 
+from telethon.tl.types import MessageEntityBold, MessageEntityItalic, MessageEntityTextUrl
+
 from telegram_vip_bot import (
+    admin_command_list_text,
+    entities_to_json,
     format_referral_code,
     main_menu_keyboard_text,
     main_menu_button_labels,
@@ -13,7 +17,9 @@ from telegram_vip_bot import (
     referral_commission,
     should_create_referral,
     updated_referral_counters,
+    json_to_entities,
     valid_withdrawal_amount,
+    validate_broadcast_time,
     withdrawal_details_text,
 )
 
@@ -92,6 +98,33 @@ class ReferralWithdrawalTest(unittest.TestCase):
         )
         self.assertIn('<a href="https://t.me/c/3906637568/4">Buka Group A</a>', text)
         self.assertNotIn("tombol di bawah", text)
+
+    def test_broadcast_entities_round_trip(self):
+        raw = entities_to_json(
+            [
+                MessageEntityBold(offset=0, length=4),
+                MessageEntityItalic(offset=5, length=4),
+                MessageEntityTextUrl(offset=10, length=4, url="https://example.com"),
+            ]
+        )
+        entities = json_to_entities(raw)
+        self.assertIsInstance(entities[0], MessageEntityBold)
+        self.assertIsInstance(entities[1], MessageEntityItalic)
+        self.assertIsInstance(entities[2], MessageEntityTextUrl)
+        self.assertEqual(entities[2].url, "https://example.com")
+
+    def test_validate_broadcast_time_accepts_time_and_off(self):
+        self.assertEqual(validate_broadcast_time("09:30"), "09:30")
+        self.assertEqual(validate_broadcast_time("off"), "")
+        with self.assertRaises(ValueError):
+            validate_broadcast_time("25:00")
+
+    def test_admin_command_list_includes_broadcast_commands(self):
+        text = admin_command_list_text()
+        self.assertIn("/set_broadcast", text)
+        self.assertIn("/set_broadcasttime", text)
+        self.assertIn("/test_broadcast", text)
+        self.assertIn("/commands", text)
 
 
 if __name__ == "__main__":

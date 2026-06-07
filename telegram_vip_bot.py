@@ -3,9 +3,11 @@ import asyncio
 import datetime as dt
 import html
 import io
+import json
 import logging
 import os
 import random
+import re
 import secrets
 import string
 import time
@@ -16,6 +18,25 @@ import requests
 from dotenv import load_dotenv
 from supabase import create_client
 from telethon import Button, TelegramClient, events, functions, errors
+from telethon.errors import FloodWaitError
+from telethon.tl.types import (
+    MessageEntityBlockquote,
+    MessageEntityBold,
+    MessageEntityBotCommand,
+    MessageEntityCode,
+    MessageEntityEmail,
+    MessageEntityHashtag,
+    MessageEntityItalic,
+    MessageEntityMention,
+    MessageEntityMentionName,
+    MessageEntityPhone,
+    MessageEntityPre,
+    MessageEntitySpoiler,
+    MessageEntityStrike,
+    MessageEntityTextUrl,
+    MessageEntityUnderline,
+    MessageEntityUrl,
+)
 
 from sociabuzz_client import (
     SociaBuzzError,
@@ -75,6 +96,9 @@ LAST_NAMES = [
 ACTIVE_PAYMENT_STATUSES = ("pending", "processing_paid", "invite_error", "delivery_error", "processing_delivery")
 RETRYABLE_PAYMENT_STATUSES = ("pending", "invite_error", "delivery_error")
 MIN_WITHDRAWAL_AMOUNT = 10_000
+WIB = dt.timezone(dt.timedelta(hours=7))
+BROADCAST_DISABLED_VALUES = {"", "off", "disable", "disabled", "0"}
+BROADCAST_TIME_PATTERN = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 
 
 @dataclass(frozen=True)
@@ -92,6 +116,7 @@ class Config:
     poll_max_attempts: int
     poll_batch_size: int
     qris_create_concurrency: int
+    broadcast_batch_size: int
     admin_user_ids: set[int]
     supabase_url: str
     supabase_service_role_key: str
@@ -133,6 +158,7 @@ def parse_admin_ids(raw):
 
 
 def load_config():
+    poll_batch_size = max(1, env_int("POLL_BATCH_SIZE", 20))
     return Config(
         api_id=env_int("TELEGRAM_API_ID"),
         api_hash=env_required("TELEGRAM_API_HASH"),
@@ -145,8 +171,9 @@ def load_config():
         invite_expire_hours=env_int("INVITE_EXPIRE_HOURS", 24),
         poll_interval_seconds=env_int("POLL_INTERVAL_SECONDS", 3),
         poll_max_attempts=env_int("POLL_MAX_ATTEMPTS", 300),
-        poll_batch_size=max(1, env_int("POLL_BATCH_SIZE", 20)),
+        poll_batch_size=poll_batch_size,
         qris_create_concurrency=max(1, env_int("QRIS_CREATE_CONCURRENCY", 5)),
+        broadcast_batch_size=max(1, env_int("BROADCAST_BATCH_SIZE", poll_batch_size)),
         admin_user_ids=parse_admin_ids(os.getenv("ADMIN_USER_IDS", "")),
         supabase_url=env_required("SUPABASE_URL"),
         supabase_service_role_key=env_required("SUPABASE_SERVICE_ROLE_KEY"),
@@ -165,6 +192,7 @@ class PaymentStore:
         self.user_table = config.user_table
         self.referral_table = config.referral_table
         self.withdrawal_table = config.withdrawal_table
+        self.broadcast_table = os.getenv("SUPABASE_BROADCAST_TABLE", "vip_broadcast_messages").strip() or "vip_broadcast_messages"
         self.settings_table = os.getenv("SUPABASE_SETTINGS_TABLE", "vip_bot_settings").strip() or "vip_bot_settings"
         self.client = create_client(config.supabase_url, config.supabase_service_role_key)
         self.query_retries = max(1, env_int("SUPABASE_QUERY_RETRIES", 3))
@@ -445,6 +473,81 @@ class PaymentStore:
             return default
         return int(value)
 
+    def set_broadcast_message(self, message_text, media_file_id="", media_type="", entities_json="[]"):
+        now = utc_now_iso()
+        self._execute(
+            self.client.table(self.broadcast_table).update(
+                {"is_active": False, "updated_at": now}
+            ).eq("is_active", True),
+            "deactivate broadcast messages",
+        )
+        data = {
+            "message_text": message_text or "",
+            "media_telegram_file_id": media_file_id or "",
+            "media_type": media_type or "",
+            "entities_json": entities_json or "[]",
+            "is_active": True,
+            "created_at": now,
+            "updated_at": now,
+        }
+        response = self._execute(self.client.table(self.broadcast_table).insert(data), "set broadcast message")
+        return response.data[0] if response.data else data
+
+    def get_active_broadcast_message(self):
+        response = self._execute(
+            self.client.table(self.broadcast_table).select("*").eq("is_active", True).order("id", desc=True).limit(1),
+            "get active broadcast message",
+        )
+        return response.data[0] if response.data else None
+
+    def delete_broadcast_message(self):
+        response = self._execute(
+            self.client.table(self.broadcast_table).update(
+                {"is_active": False, "updated_at": utc_now_iso()}
+            ).eq("is_active", True),
+            "delete broadcast message",
+        )
+        return bool(response.data)
+
+    def get_broadcast_targets(self, limit=20):
+        response = self._execute(
+            self.client.table(self.user_table)
+            .select("user_id")
+            .eq("is_bot", False)
+            .order("last_broadcast_at", desc=False, nullsfirst=True)
+            .order("user_id", desc=False)
+            .limit(max(1, int(limit))),
+            "get broadcast targets",
+        )
+        return response.data or []
+
+    def mark_user_broadcasted(self, user_id):
+        self._execute(
+            self.client.table(self.user_table).update(
+                {"last_broadcast_at": utc_now_iso(), "updated_at": utc_now_iso()}
+            ).eq("user_id", int(user_id)),
+            "mark user broadcasted",
+        )
+
+    def count_broadcast_targets(self):
+        response = self._execute(
+            self.client.table(self.user_table).select("user_id", count="exact").eq("is_bot", False).limit(1),
+            "count broadcast targets",
+        )
+        return int(response.count or 0)
+
+    def set_broadcast_time(self, time_str):
+        self.set_setting("broadcast_time", time_str or "")
+
+    def get_broadcast_time(self):
+        return self.get_setting("broadcast_time", "")
+
+    def set_last_broadcast_date(self, date_str):
+        self.set_setting("last_broadcast_date", date_str or "")
+
+    def get_last_broadcast_date(self):
+        return self.get_setting("last_broadcast_date", "")
+
     def upsert_user(self, user):
         existing = self.get_user(user.id)
         code = existing.get("referral_code") if existing else format_referral_code(user.id)
@@ -453,6 +556,7 @@ class PaymentStore:
             "username": user.username or "",
             "full_name": display_name(user),
             "referral_code": code,
+            "is_bot": bool(getattr(user, "bot", False)),
             "updated_at": utc_now_iso(),
         }
         if not existing:
@@ -766,6 +870,36 @@ def main_menu_keyboard_text(user):
     return f"Hi {html.escape(name)}, Welcome di Bot Payment @boboinaja."
 
 
+def validate_broadcast_time(raw):
+    value = (raw or "").strip().lower()
+    if value in BROADCAST_DISABLED_VALUES:
+        return ""
+    if not BROADCAST_TIME_PATTERN.fullmatch(value):
+        raise ValueError("Format: /set_broadcasttime HH:MM atau /set_broadcasttime off")
+    return value
+
+
+def admin_command_list_text():
+    return "\n".join(
+        [
+            "<b>Daftar Command Admin</b>",
+            "",
+            "/chatid - Lihat chat_id logging chat",
+            "/custom &lt;amount&gt; - Buat QRIS custom",
+            "/package_add &lt;kode&gt; &lt;nama&gt;|&lt;chat_id&gt;|&lt;harga&gt; - Tambah/update paket",
+            "/package_list - Lihat paket aktif",
+            "/package_delete &lt;kode&gt; - Nonaktifkan paket",
+            "/setvip &lt;chat_id|here&gt; - Set VIP chat default",
+            "/setlog &lt;chat_id|here&gt; - Set logging chat",
+            "/config - Lihat config aktif",
+            "/set_broadcast - Reply pesan untuk disimpan sebagai broadcast",
+            "/set_broadcasttime &lt;HH:MM|off&gt; - Jadwalkan broadcast harian WIB",
+            "/test_broadcast - Kirim test broadcast hanya ke admin",
+            "/commands - Tampilkan daftar command ini",
+        ]
+    )
+
+
 def normalize_package_code(code):
     normalized = (code or "").strip().lower()
     if not normalized:
@@ -823,6 +957,53 @@ def is_user_deactivated_error(exc):
 
 def is_sociabuzz_timeout(exc):
     return isinstance(exc, (requests.Timeout, TimeoutError)) or "timed out" in str(exc).lower()
+
+
+ENTITY_NAME_MAP = {
+    "MessageEntityBlockquote": MessageEntityBlockquote,
+    "MessageEntityBold": MessageEntityBold,
+    "MessageEntityBotCommand": MessageEntityBotCommand,
+    "MessageEntityCode": MessageEntityCode,
+    "MessageEntityEmail": MessageEntityEmail,
+    "MessageEntityHashtag": MessageEntityHashtag,
+    "MessageEntityItalic": MessageEntityItalic,
+    "MessageEntityMention": MessageEntityMention,
+    "MessageEntityMentionName": MessageEntityMentionName,
+    "MessageEntityPhone": MessageEntityPhone,
+    "MessageEntityPre": MessageEntityPre,
+    "MessageEntitySpoiler": MessageEntitySpoiler,
+    "MessageEntityStrike": MessageEntityStrike,
+    "MessageEntityTextUrl": MessageEntityTextUrl,
+    "MessageEntityUnderline": MessageEntityUnderline,
+    "MessageEntityUrl": MessageEntityUrl,
+}
+
+
+def entities_to_json(entities):
+    if not entities:
+        return "[]"
+    return json.dumps([entity.to_dict() for entity in entities], ensure_ascii=False)
+
+
+def json_to_entities(raw):
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        LOGGER.warning("Invalid broadcast entities JSON: %r", raw)
+        return []
+    entities = []
+    for item in data or []:
+        cls = ENTITY_NAME_MAP.get(item.get("_"))
+        if not cls:
+            continue
+        args = {key: value for key, value in item.items() if key != "_"}
+        try:
+            entities.append(cls(**args))
+        except TypeError as exc:
+            LOGGER.warning("Failed to rebuild entity %s: %s", item.get("_"), exc)
+    return entities
 
 
 def format_qris_expiry(raw_expires):
@@ -958,6 +1139,43 @@ async def safe_send_user(client, config, store, user_id, text, **kwargs):
             ),
         )
         return status
+
+
+async def send_broadcast_to_user(client, user_id, broadcast_message):
+    async def send_once():
+        text = broadcast_message.get("message_text") or ""
+        media_file_id = broadcast_message.get("media_telegram_file_id") or ""
+        entities = json_to_entities(broadcast_message.get("entities_json") or "[]")
+        entity_kwargs = {"formatting_entities": entities} if entities else {}
+        if media_file_id:
+            await client.send_file(user_id, media_file_id, caption=text or None, parse_mode=None, **entity_kwargs)
+        elif text:
+            await client.send_message(user_id, text, parse_mode=None, **entity_kwargs)
+        else:
+            return "empty"
+        return "sent"
+
+    error = None
+    try:
+        return await send_once()
+    except FloodWaitError as exc:
+        LOGGER.warning("FloodWait %ss while broadcasting to user %s", exc.seconds, user_id)
+        await asyncio.sleep(max(1, int(exc.seconds)))
+        try:
+            return await send_once()
+        except Exception as retry_exc:
+            error = retry_exc
+    except Exception as exc:
+        error = exc
+
+    if is_user_blocked_error(error):
+        LOGGER.warning("User %s blocked the bot, cannot deliver broadcast", user_id)
+        return "blocked"
+    if is_user_deactivated_error(error):
+        LOGGER.warning("User %s is deleted/deactivated, cannot deliver broadcast", user_id)
+        return "deactivated"
+    LOGGER.warning("Broadcast send error to user %s: %s", user_id, error)
+    return "error"
 
 
 def create_qris_sync(config, user, amount=None, note_prefix="VIP"):
@@ -1806,6 +2024,78 @@ async def polling_loop(client, config, store):
         await asyncio.sleep(config.poll_interval_seconds)
 
 
+async def send_broadcast_batch(client, store, broadcast_message, user_ids, concurrency):
+    semaphore = asyncio.Semaphore(max(1, int(concurrency)))
+
+    async def send_one(user_id):
+        async with semaphore:
+            status = await send_broadcast_to_user(client, user_id, broadcast_message)
+            if status in {"sent", "blocked", "deactivated"}:
+                await asyncio.to_thread(store.mark_user_broadcasted, user_id)
+            return status
+
+    results = await asyncio.gather(*(send_one(user_id) for user_id in user_ids))
+    return {
+        "sent": results.count("sent"),
+        "blocked": results.count("blocked"),
+        "deactivated": results.count("deactivated"),
+        "error": results.count("error") + results.count("empty"),
+    }
+
+
+async def broadcast_loop(client, config, store):
+    while True:
+        try:
+            broadcast_time = (await asyncio.to_thread(store.get_broadcast_time)).strip().lower()
+            if broadcast_time in BROADCAST_DISABLED_VALUES:
+                await asyncio.sleep(60)
+                continue
+            now = dt.datetime.now(WIB)
+            today = now.strftime("%Y-%m-%d")
+            if await asyncio.to_thread(store.get_last_broadcast_date) == today:
+                await asyncio.sleep(60)
+                continue
+            if now.strftime("%H:%M") < broadcast_time:
+                await asyncio.sleep(60)
+                continue
+
+            broadcast_message = await asyncio.to_thread(store.get_active_broadcast_message)
+            if not broadcast_message:
+                await asyncio.to_thread(store.set_last_broadcast_date, today)
+                await send_log(client, config, store, "<b>Daily broadcast skipped</b>\nBelum ada broadcast aktif.")
+                await asyncio.sleep(60)
+                continue
+
+            totals = {"sent": 0, "blocked": 0, "deactivated": 0, "error": 0}
+            while True:
+                targets = await asyncio.to_thread(store.get_broadcast_targets, config.broadcast_batch_size)
+                user_ids = [int(target["user_id"]) for target in targets]
+                if not user_ids:
+                    break
+                batch = await send_broadcast_batch(client, store, broadcast_message, user_ids, config.qris_create_concurrency)
+                for key, value in batch.items():
+                    totals[key] += value
+                await asyncio.sleep(1)
+
+            await asyncio.to_thread(store.set_last_broadcast_date, today)
+            await send_log(
+                client,
+                config,
+                store,
+                (
+                    "<b>Broadcast selesai</b>\n"
+                    f"Terkirim: <code>{totals['sent']}</code>\n"
+                    f"Blocked: <code>{totals['blocked']}</code>\n"
+                    f"Deactivated: <code>{totals['deactivated']}</code>\n"
+                    f"Error: <code>{totals['error']}</code>"
+                ),
+            )
+        except Exception as exc:
+            LOGGER.exception("Broadcast loop error")
+            await send_log(client, config, store, f"<b>Broadcast loop error</b>\n<code>{html.escape(str(exc))}</code>")
+        await asyncio.sleep(60)
+
+
 def private_only(handler):
     async def wrapped(event):
         if not event.is_private:
@@ -1848,6 +2138,22 @@ async def require_log_chat(event, config, store):
         log_chat_id = config.log_chat_id
     if event.chat_id == log_chat_id and not event.is_private:
         return True
+    await event.respond("Command ini cuma bisa dipakai di group/channel logging.")
+    return False
+
+
+async def require_admin_logchat(event, config, store):
+    if not is_admin(config, event.sender_id):
+        return False
+    try:
+        log_chat_id = runtime_log_chat_id(config, store)
+    except Exception as exc:
+        LOGGER.warning("Failed to load runtime log_chat_id for command guard: %s", exc)
+        log_chat_id = config.log_chat_id
+    if event.chat_id == log_chat_id and not event.is_private:
+        return True
+    if event.is_private:
+        return False
     await event.respond("Command ini cuma bisa dipakai di group/channel logging.")
     return False
 
@@ -2173,17 +2479,15 @@ async def main():
             await event.answer("Gagal memproses withdrawal. Cek log.", alert=True)
             await send_log(event.client, config, store, f"<b>Withdrawal admin action error</b>\nID: <code>{html.escape(withdrawal_id)}</code>\n<code>{html.escape(str(exc))}</code>")
 
-    @client.on(events.NewMessage(pattern=r"^/chatid$"))
+    @client.on(events.NewMessage(pattern=r"^/chatid(?:@\w+)?$"))
     async def chat_id(event):
-        if not event.is_private and not await require_admin(event, config, store):
+        if not await require_admin_logchat(event, config, store):
             return
         await event.respond(f"chat_id: `{event.chat_id}`")
 
     @client.on(events.NewMessage(pattern=r"^/custom(?:@\w+)?(?:\s+(.+))?$"))
     async def custom_payment(event):
-        if not await require_admin(event, config, store):
-            return
-        if not await require_log_chat(event, config, store):
+        if not await require_admin_logchat(event, config, store):
             return
         raw_amount = (event.pattern_match.group(1) or "").strip()
         if not raw_amount:
@@ -2204,9 +2508,7 @@ async def main():
 
     @client.on(events.NewMessage(pattern=r"^/package_add(?:@\w+)?(?:\s+(.+))?$"))
     async def package_add(event):
-        if not await require_admin(event, config, store):
-            return
-        if not await require_log_chat(event, config, store):
+        if not await require_admin_logchat(event, config, store):
             return
         try:
             code, name, vip_chat_id, amount = parse_package_add_args(event.pattern_match.group(1) or "")
@@ -2235,16 +2537,14 @@ async def main():
 
     @client.on(events.NewMessage(pattern=r"^/package_list(?:@\w+)?$"))
     async def package_list(event):
-        if not await require_admin(event, config, store):
+        if not await require_admin_logchat(event, config, store):
             return
         packages = store.list_packages()
         await event.respond(package_list_text(packages), parse_mode="html")
 
     @client.on(events.NewMessage(pattern=r"^/package_delete(?:@\w+)?(?:\s+(.+))?$"))
     async def package_delete(event):
-        if not await require_admin(event, config, store):
-            return
-        if not await require_log_chat(event, config, store):
+        if not await require_admin_logchat(event, config, store):
             return
         code = (event.pattern_match.group(1) or "").strip()
         if not code:
@@ -2268,9 +2568,9 @@ async def main():
             await event.respond("Gagal hapus paket. Detail error dikirim ke log admin.")
             await send_log(client, config, store, f"<b>Package delete error</b>\nAdmin: <code>{event.sender_id}</code>\n<code>{html.escape(str(exc))}</code>")
 
-    @client.on(events.NewMessage(pattern=r"^/setvip(?:\s+(.+))?$"))
+    @client.on(events.NewMessage(pattern=r"^/setvip(?:@\w+)?(?:\s+(.+))?$"))
     async def set_vip(event):
-        if not await require_admin(event, config, store):
+        if not await require_admin_logchat(event, config, store):
             return
         raw_value = event.pattern_match.group(1)
         if not raw_value:
@@ -2286,9 +2586,9 @@ async def main():
             await event.respond("Gagal set VIP chat. Detail error dikirim ke log admin.")
             await send_log(client, config, store, f"<b>Set VIP chat error</b>\nAdmin: <code>{event.sender_id}</code>\n<code>{html.escape(str(exc))}</code>")
 
-    @client.on(events.NewMessage(pattern=r"^/setlog(?:\s+(.+))?$"))
+    @client.on(events.NewMessage(pattern=r"^/setlog(?:@\w+)?(?:\s+(.+))?$"))
     async def set_log(event):
-        if not await require_admin(event, config, store):
+        if not await require_admin_logchat(event, config, store):
             return
         raw_value = event.pattern_match.group(1)
         if not raw_value:
@@ -2304,9 +2604,9 @@ async def main():
             await event.respond("Gagal set log chat. Detail error dikirim ke log admin.")
             await send_log(client, config, store, f"<b>Set log chat error</b>\nAdmin: <code>{event.sender_id}</code>\n<code>{html.escape(str(exc))}</code>")
 
-    @client.on(events.NewMessage(pattern=r"^/config$"))
+    @client.on(events.NewMessage(pattern=r"^/config(?:@\w+)?$"))
     async def show_config(event):
-        if not await require_admin(event, config, store):
+        if not await require_admin_logchat(event, config, store):
             return
         vip_chat_id = runtime_vip_chat_id(config, store)
         log_chat_id = runtime_log_chat_id(config, store)
@@ -2316,13 +2616,88 @@ async def main():
             f"LOG_CHAT_ID: `{log_chat_id or 'belum diset'}`\n"
             f"PAYMENT_AMOUNT: `{config.payment_amount}`\n"
             f"SUPABASE_PACKAGE_TABLE: `{config.supabase_package_table}`\n"
+            f"BROADCAST_BATCH_SIZE: `{config.broadcast_batch_size}`\n"
             f"INVITE_EXPIRE_HOURS: `{config.invite_expire_hours}`"
+        )
+
+    @client.on(events.NewMessage(pattern=r"^/commands?(?:@\w+)?$"))
+    async def commands(event):
+        if not await require_admin_logchat(event, config, store):
+            return
+        await event.respond(admin_command_list_text(), parse_mode="html")
+
+    @client.on(events.NewMessage(pattern=r"^/set_broadcast(?:@\w+)?$"))
+    async def set_broadcast(event):
+        if not await require_admin_logchat(event, config, store):
+            return
+        replied = await event.get_reply_message()
+        if not replied:
+            await event.respond("Reply ke pesan yang mau dijadikan broadcast.")
+            return
+        text = replied.raw_text or ""
+        media_file_id = getattr(getattr(replied, "file", None), "id", "") or ""
+        media_type = getattr(getattr(replied, "file", None), "mime_type", "") or ""
+        if not text and not media_file_id:
+            await event.respond("Pesan harus memiliki teks atau media.")
+            return
+        saved = store.set_broadcast_message(text, media_file_id, media_type, entities_to_json(replied.entities or []))
+        await event.respond("Broadcast berhasil disimpan. Gunakan /test_broadcast untuk uji coba.")
+        await send_log(
+            client,
+            config,
+            store,
+            (
+                "<b>Broadcast saved</b>\n"
+                f"ID: <code>{saved.get('id', '')}</code>\n"
+                f"Admin: <code>{event.sender_id}</code>\n"
+                f"Media: <code>{html.escape(media_type or '-')}</code>"
+            ),
+        )
+
+    @client.on(events.NewMessage(pattern=r"^/set_broadcasttime(?:@\w+)?(?:\s+(.+))?$"))
+    async def set_broadcast_time(event):
+        if not await require_admin_logchat(event, config, store):
+            return
+        raw_value = event.pattern_match.group(1) or ""
+        try:
+            time_value = validate_broadcast_time(raw_value)
+        except ValueError:
+            await event.respond("Format: `/set_broadcasttime HH:MM` contoh `/set_broadcasttime 09:00`, atau `/set_broadcasttime off`.")
+            return
+        store.set_broadcast_time(time_value)
+        store.set_last_broadcast_date("")
+        if not time_value:
+            await event.respond("Broadcast otomatis dinonaktifkan.")
+            return
+        await event.respond(f"Broadcast otomatis dijadwalkan setiap <b>{html.escape(time_value)} WIB</b>.", parse_mode="html")
+
+    @client.on(events.NewMessage(pattern=r"^/test_broadcast(?:@\w+)?$"))
+    async def test_broadcast(event):
+        if not await require_admin_logchat(event, config, store):
+            return
+        broadcast_message = store.get_active_broadcast_message()
+        if not broadcast_message:
+            await event.respond("Belum ada broadcast yang disimpan. Gunakan /set_broadcast dulu.")
+            return
+        admin_ids = sorted(config.admin_user_ids)
+        if not admin_ids:
+            await event.respond("ADMIN_USER_IDS belum diisi.")
+            return
+        totals = await send_broadcast_batch(client, store, broadcast_message, admin_ids, config.qris_create_concurrency)
+        await event.respond(
+            "Test broadcast selesai.\n"
+            f"Terkirim: <code>{totals['sent']}</code>\n"
+            f"Blocked: <code>{totals['blocked']}</code>\n"
+            f"Deactivated: <code>{totals['deactivated']}</code>\n"
+            f"Error: <code>{totals['error']}</code>",
+            parse_mode="html",
         )
 
     await client.start(bot_token=config.bot_token)
     await send_log(client, config, store, "<b>VIP bot started</b>")
     LOGGER.info("VIP bot started")
     asyncio.create_task(polling_loop(client, config, store))
+    asyncio.create_task(broadcast_loop(client, config, store))
     await client.run_until_disconnected()
 
 
