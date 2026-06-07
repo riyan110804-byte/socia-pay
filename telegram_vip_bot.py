@@ -509,12 +509,12 @@ class PaymentStore:
         )
         return bool(response.data)
 
-    def get_broadcast_targets(self, limit=20):
+    def get_broadcast_targets(self, limit=20, before_iso=None):
+        query = self.client.table(self.user_table).select("user_id").eq("is_bot", False)
+        if before_iso:
+            query = query.or_(f"last_broadcast_at.is.null,last_broadcast_at.lt.{before_iso}")
         response = self._execute(
-            self.client.table(self.user_table)
-            .select("user_id")
-            .eq("is_bot", False)
-            .order("last_broadcast_at", desc=False, nullsfirst=True)
+            query.order("last_broadcast_at", desc=False, nullsfirst=True)
             .order("user_id", desc=False)
             .limit(max(1, int(limit))),
             "get broadcast targets",
@@ -2052,6 +2052,7 @@ async def broadcast_loop(client, config, store):
                 continue
             now = dt.datetime.now(WIB)
             today = now.strftime("%Y-%m-%d")
+            broadcast_day_start = now.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(dt.UTC).isoformat()
             if await asyncio.to_thread(store.get_last_broadcast_date) == today:
                 await asyncio.sleep(60)
                 continue
@@ -2068,7 +2069,11 @@ async def broadcast_loop(client, config, store):
 
             totals = {"sent": 0, "blocked": 0, "deactivated": 0, "error": 0}
             while True:
-                targets = await asyncio.to_thread(store.get_broadcast_targets, config.broadcast_batch_size)
+                targets = await asyncio.to_thread(
+                    store.get_broadcast_targets,
+                    config.broadcast_batch_size,
+                    broadcast_day_start,
+                )
                 user_ids = [int(target["user_id"]) for target in targets]
                 if not user_ids:
                     break
