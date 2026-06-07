@@ -1036,33 +1036,29 @@ async def create_invite_link(client, config, store, payment):
 def qris_caption(package, inv_id, checkout_amount, final_amount, expires):
     public_invoice = html.escape(inv_id)
     package_name = html.escape(package["name"])
-    human_expires = html.escape(format_qris_expiry(expires))
+    human_expires = format_custom_qris_expiry(expires) if expires else ""
     detail_lines = [
-        f"Kode pesanan: {public_invoice}",
-        f"Paket: {package_name}",
-        f"Nominal paket: {format_rupiah(checkout_amount)}",
+        f"<b>Kode Pesanan</b>: <code>{public_invoice}</code>",
+        f"<b>Paket</b>: {package_name}",
+        f"<b>Nominal Paket</b>: {format_rupiah(checkout_amount)}",
     ]
     if final_amount:
-        detail_lines.append(f"Nominal QRIS: {html.escape(final_amount)}")
+        detail_lines.append(f"<b>Nominal QRIS</b>: {html.escape(final_amount)}")
     if human_expires:
-        detail_lines.append(f"⏳ Batas bayar: {human_expires}")
+        detail_lines.append(f"<b>⏳ Batas Bayar</b>: {human_expires}")
     lines = [
-        "🔥 <b>Akses VIP Premium</b>",
+        f"🔥 <b>Akses {package_name}</b>",
         "",
         f"<blockquote>{'\n'.join(detail_lines)}</blockquote>",
+        "",
+        "📌 <b>Aturan pembayaran</b>",
+        "• Scan QRIS ini lalu bayar sesuai nominal QRIS.",
+        "• Bayar 1 kali saja, jangan diulang.",
+        "• QRIS ini unik khusus pesanan kamu.",
+        "• Status dicek otomatis, tidak perlu kirim bukti transfer.",
+        "",
+        f"Setelah pembayaran terdeteksi, link akses {package_name} akan langsung dikirim otomatis.",
     ]
-    lines.extend(
-        [
-            "",
-            "📌 <b>Aturan pembayaran</b>",
-            "• Scan QRIS ini lalu bayar <b>sesuai nominal QRIS</b>.",
-            "• Bayar <b>1 kali saja</b>, jangan diulang.",
-            "• QRIS ini <b>unik khusus pesanan kamu</b>.",
-            "• Status dicek otomatis, tidak perlu kirim bukti transfer.",
-            "",
-            "Setelah pembayaran terdeteksi, link VIP akan langsung dikirim otomatis.",
-        ]
-    )
     return "\n".join(lines)
 
 
@@ -1500,7 +1496,7 @@ async def credit_referral_if_needed(client, config, store, payment):
         config,
         store,
         (
-            "<b>REFERRAL COMMISSION CREDITED</b>\n\n"
+            "<b>REFERRAL COMISSION CREDITED</b>\n\n"
             "<blockquote>"
             "<b>INVITER</b>\n"
             f"<b>Name</b>: {html.escape(referrer_row.get('full_name') or str(referrer_row.get('user_id')))}\n"
@@ -1889,16 +1885,18 @@ async def handle_referral_start(event, config, store, payload):
             f"✅ {html.escape(display_name(user))} berhasil diundang menggunakan referral link kamu.",
             parse_mode="html",
         )
+        invited_row = {
+            "user_id": user.id,
+            "username": user.username or "",
+            "full_name": display_name(user),
+        }
         await send_log(
             event.client,
             config,
             store,
             (
-                "<b>Referral joined</b>\n\n"
-                f"<b>Yang Invite</b>\n{referral_user_log_text(referrer)}\n\n"
-                f"<b>User yang Diundang</b>\n{telegram_user_link(user)}\nUser ID: <code>{user.id}</code>"
-                f"{f'\nUsername: @{html.escape(user.username)}' if user.username else ''}\n\n"
-                f"Referral code: <code>{html.escape(code)}</code>"
+                f"User {plain_user_link(invited_row)} joined using Referral User {plain_user_link(referrer)}\n\n"
+                f"Referral Code: {html.escape(code)}"
             ),
         )
     except Exception as exc:
