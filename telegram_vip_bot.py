@@ -12,6 +12,7 @@ import time
 from dataclasses import dataclass
 
 import httpx
+import requests
 from dotenv import load_dotenv
 from supabase import create_client
 from telethon import Button, TelegramClient, events, functions, errors
@@ -815,6 +816,15 @@ def is_user_blocked_error(exc):
     return isinstance(exc, errors.UserIsBlockedError) or "User is blocked" in str(exc)
 
 
+def is_user_deactivated_error(exc):
+    deactivated_error = getattr(errors, "InputUserDeactivatedError", None)
+    return (deactivated_error is not None and isinstance(exc, deactivated_error)) or "user was deleted" in str(exc).lower()
+
+
+def is_sociabuzz_timeout(exc):
+    return isinstance(exc, (requests.Timeout, TimeoutError)) or "timed out" in str(exc).lower()
+
+
 def format_qris_expiry(raw_expires):
     if not raw_expires:
         return ""
@@ -824,9 +834,51 @@ def format_qris_expiry(raw_expires):
     return parsed.astimezone(dt.timezone(dt.timedelta(hours=7))).strftime("%d/%m/%Y %H:%M WIB")
 
 
+def format_log_datetime(raw_datetime):
+    parsed = parse_iso_datetime(raw_datetime)
+    if not parsed:
+        return html.escape(str(raw_datetime or ""))
+    local = parsed.astimezone(dt.timezone(dt.timedelta(hours=7)))
+    return html.escape(local.strftime("%Y %B %d, %H:%M:%S WIB"))
+
+
+def format_custom_qris_expiry(raw_expires):
+    parsed = parse_iso_datetime(raw_expires)
+    if not parsed:
+        return html.escape(str(raw_expires or ""))
+    local = parsed.astimezone(dt.timezone(dt.timedelta(hours=7)))
+    month_names = {
+        1: "Januari",
+        2: "Februari",
+        3: "Maret",
+        4: "April",
+        5: "Mei",
+        6: "Juni",
+        7: "Juli",
+        8: "Agustus",
+        9: "September",
+        10: "Oktober",
+        11: "November",
+        12: "Desember",
+    }
+    return f"{local.day} {month_names[local.month]} {local.year}, {local:%H:%M:%S} WIB"
+
+
 def user_link(row):
     name = html.escape(row["full_name"] or str(row["user_id"]))
     return f'<a href="tg://user?id={row["user_id"]}">{name}</a>'
+
+
+def username_or_name(row):
+    username = (row.get("username") or "").strip()
+    if username:
+        return f"@{html.escape(username)}"
+    return html.escape(row.get("full_name") or str(row.get("user_id") or ""))
+
+
+def plain_user_link(row):
+    user_id = int(row.get("user_id") or 0)
+    return f'<a href="tg://user?id={user_id}">{username_or_name(row)}</a>'
 
 
 def referral_user_log_text(row):
@@ -886,15 +938,21 @@ async def safe_send_user(client, config, store, user_id, text, **kwargs):
         if is_user_blocked_error(exc):
             LOGGER.warning("User %s blocked the bot, cannot deliver message", user_id)
             status = "blocked"
+            log_title = "User delivery blocked"
+        elif is_user_deactivated_error(exc):
+            LOGGER.warning("User %s is deleted/deactivated, cannot deliver message", user_id)
+            status = "blocked"
+            log_title = "User delivery deactivated"
         else:
             LOGGER.exception("Failed to send message to user %s", user_id)
             status = "error"
+            log_title = "User delivery error"
         await send_log(
             client,
             config,
             store,
             (
-                "<b>User delivery error</b>\n"
+                f"<b>{log_title}</b>\n"
                 f"User: <code>{user_id}</code>\n"
                 f"Error: <code>{html.escape(str(exc))}</code>"
             ),
@@ -927,6 +985,29 @@ def create_qris_sync(config, user, amount=None, note_prefix="VIP"):
         qr_response.content,
         checkout_amount,
     )
+
+
+def create_qris_with_retries_sync(config, user, amount=None, note_prefix="VIP", attempts=3):
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return create_qris_sync(config, user, amount, note_prefix)
+        except Exception as exc:
+            last_exc = exc
+            if not is_sociabuzz_timeout(exc) or attempt >= attempts:
+                raise
+            delay = min(6, 2 ** (attempt - 1)) + random.uniform(0, 0.5)
+            LOGGER.warning(
+                "SociaBuzz timed out while creating %s QRIS for user %s, retrying in %.1fs (%s/%s): %s",
+                note_prefix,
+                user.id,
+                delay,
+                attempt,
+                attempts,
+                exc,
+            )
+            time.sleep(delay)
+    raise last_exc
 
 
 def check_payment_sync(config, inv_id):
@@ -987,27 +1068,26 @@ def qris_caption(package, inv_id, checkout_amount, final_amount, expires):
 
 def custom_qris_caption(inv_id, checkout_amount, final_amount, expires, user):
     public_invoice = html.escape(inv_id)
-    human_expires = html.escape(format_qris_expiry(expires))
+    human_expires = format_custom_qris_expiry(expires) if expires else ""
+    detail_lines = [
+        f"<b>Kode Pesanan</b>: {public_invoice}",
+        f"<b>Requester</b>: {telegram_user_link(user)} ({user.id})",
+        f"<b>Nominal Custom</b>: {format_rupiah(checkout_amount)}",
+    ]
+    if final_amount:
+        detail_lines.append(f"<b>Nominal QRIS</b>: {html.escape(final_amount)}")
+    if human_expires:
+        detail_lines.append(f"<b>⏳ Batas Bayar</b>: {human_expires}")
     lines = [
         "🧾 <b>Custom QRIS</b>",
         "",
-        f"Kode pesanan: <code>{public_invoice}</code>",
-        f"Requester: {telegram_user_link(user)} (<code>{user.id}</code>)",
-        f"Nominal custom: <code>{format_rupiah(checkout_amount)}</code>",
+        f"<blockquote>{'\n'.join(detail_lines)}</blockquote>",
+        "",
+        "📌 <b>Aturan pembayaran</b>",
+        "• Bayar <b>sesuai nominal QRIS</b>.",
+        "• Bayar <b>1 kali saja</b>, jangan diulang.",
+        "• Status akan dicek otomatis.",
     ]
-    if final_amount:
-        lines.append(f"Nominal QRIS: <code>{html.escape(final_amount)}</code>")
-    if human_expires:
-        lines.append(f"⏳ Batas bayar: <code>{human_expires}</code>")
-    lines.extend(
-        [
-            "",
-            "📌 <b>Aturan pembayaran</b>",
-            "• Bayar <b>sesuai nominal QRIS</b>.",
-            "• Bayar <b>1 kali saja</b>, jangan diulang.",
-            "• Status akan dicek otomatis.",
-        ]
-    )
     return "\n".join(lines)
 
 
@@ -1121,7 +1201,7 @@ async def send_qris_locked(event, config, store, qris_semaphore, user, package=N
                 qris,
                 qr_bytes,
                 checkout_amount,
-            ) = await asyncio.to_thread(create_qris_sync, config, user, int(package["amount"]), package["code"].upper())
+            ) = await asyncio.to_thread(create_qris_with_retries_sync, config, user, int(package["amount"]), package["code"].upper())
         socia_invoice_id = qris.get("inv_id")
         if not socia_invoice_id:
             raise SociaBuzzError(f"QRIS response missing inv_id: {qris}")
@@ -1164,20 +1244,24 @@ async def send_qris_locked(event, config, store, qris_semaphore, user, package=N
             config,
             store,
             (
-                "<b>QRIS created</b>\n"
-                f"User: {telegram_user_link(user)} (<code>{user.id}</code>)\n"
-                f"{package_log_line(package)}\n"
-                f"Invoice: <code>{html.escape(buyer_invoice_id)}</code>\n"
-                f"Internal invoice: <code>{html.escape(socia_invoice_id)}</code>\n"
-                f"Source payment: <code>{html.escape(qris.get('source_payment') or '')}</code>\n"
-                f"Order: <code>{html.escape(order_id)}</code>\n"
-                f"Checkout amount: <code>{checkout_amount}</code>\n"
-                f"QRIS amount: <code>{html.escape(payload.get('amount') or '')}</code>"
+                "<b>QRIS CREATED</b>\n\n"
+                "<blockquote>"
+                f"<b>User</b>: {telegram_user_link(user)} ({user.id})\n"
+                f"<b>Package</b>: {html.escape(package.get('code') or '')} {html.escape(package.get('name') or '')} ({package.get('vip_chat_id') or ''})\n"
+                f"<b>Package Amount</b>: {format_button_amount(checkout_amount)}\n"
+                f"<b>QRIS Amount</b>: {html.escape(payload.get('amount') or '')}\n"
+                f"<b>Invoice</b>: {html.escape(buyer_invoice_id)}\n"
+                f"<b>Internal Invoice</b>: {html.escape(socia_invoice_id)}\n"
+                f"<b>Source Payment</b>: {html.escape(qris.get('source_payment') or '')}\n"
+                f"<b>Order ID</b>: {html.escape(order_id)}"
+                "</blockquote>"
             ),
         )
     except Exception as exc:
         if is_cloudflare_challenge(exc):
             LOGGER.warning("SociaBuzz Cloudflare challenge while creating QRIS for user %s", user.id)
+        elif is_sociabuzz_timeout(exc):
+            LOGGER.warning("SociaBuzz timed out while creating QRIS for user %s after retries: %s", user.id, exc)
         else:
             LOGGER.exception("Failed to create QRIS")
         try:
@@ -1185,7 +1269,7 @@ async def send_qris_locked(event, config, store, qris_semaphore, user, package=N
         except Exception:
             LOGGER.warning("Failed to delete invoice message after create error", exc_info=True)
         if is_cloudflare_challenge(exc):
-            await event.respond("QRIS belum bisa dibuat karena gateway pembayaran sedang membatasi request. Coba lagi beberapa menit lagi.")
+            await event.respond("QRIS belum bisa dibuat karena sistem sedang membatasi request. Coba lagi beberapa menit lagi.")
             await send_log(
                 event.client,
                 config,
@@ -1206,6 +1290,20 @@ async def send_qris_locked(event, config, store, qris_semaphore, user, package=N
                 (
                     "<b>Duplicate active payment blocked</b>\n"
                     f"User: {telegram_user_link(user)} (<code>{user.id}</code>)"
+                ),
+            )
+            return
+        if is_sociabuzz_timeout(exc):
+            await event.respond("QRIS lagi lambat dibuat. Coba lagi sebentar lagi ya.")
+            await send_log(
+                event.client,
+                config,
+                store,
+                (
+                    "<b>QRIS gateway timeout</b>\n"
+                    f"User: {telegram_user_link(user)} (<code>{user.id}</code>)\n"
+                    f"Package: <code>{html.escape(package.get('code') or '')}</code> {html.escape(package.get('name') or '')}\n"
+                    f"Error: <code>{html.escape(str(exc))}</code>"
                 ),
             )
             return
@@ -1260,7 +1358,7 @@ async def send_custom_qris_locked(event, config, store, qris_semaphore, user, am
                 qris,
                 qr_bytes,
                 checkout_amount,
-            ) = await asyncio.to_thread(create_qris_sync, config, user, amount, "CUSTOM")
+            ) = await asyncio.to_thread(create_qris_with_retries_sync, config, user, amount, "CUSTOM")
         socia_invoice_id = qris.get("inv_id")
         if not socia_invoice_id:
             raise SociaBuzzError(f"QRIS response missing inv_id: {qris}")
@@ -1300,19 +1398,23 @@ async def send_custom_qris_locked(event, config, store, qris_semaphore, user, am
             config,
             store,
             (
-                "<b>Custom QRIS created</b>\n"
-                f"User: {telegram_user_link(user)} (<code>{user.id}</code>)\n"
-                f"Invoice: <code>{html.escape(buyer_invoice_id)}</code>\n"
-                f"Internal invoice: <code>{html.escape(socia_invoice_id)}</code>\n"
-                f"Source payment: <code>{html.escape(qris.get('source_payment') or '')}</code>\n"
-                f"Order: <code>{html.escape(order_id)}</code>\n"
-                f"Custom amount: <code>{checkout_amount}</code>\n"
-                f"QRIS amount: <code>{html.escape(payload.get('amount') or '')}</code>"
+                "<b>Custom QRIS CREATED</b>\n\n"
+                "<blockquote>"
+                f"<b>User</b>: {telegram_user_link(user)} ({user.id})\n"
+                f"<b>Custom QRIS Amount</b>: {format_rupiah(checkout_amount)}\n"
+                f"<b>QRIS Amount</b>: {html.escape(payload.get('amount') or '')}\n"
+                f"<b>Invoice</b>: {html.escape(buyer_invoice_id)}\n"
+                f"<b>Internal Invoice</b>: {html.escape(socia_invoice_id)}\n"
+                f"<b>Source Payment</b>: {html.escape(qris.get('source_payment') or '')}\n"
+                f"<b>Order ID</b>: {html.escape(order_id)}"
+                "</blockquote>"
             ),
         )
     except Exception as exc:
         if is_cloudflare_challenge(exc):
             LOGGER.warning("SociaBuzz Cloudflare challenge while creating custom QRIS for user %s", user.id)
+        elif is_sociabuzz_timeout(exc):
+            LOGGER.warning("SociaBuzz timed out while creating custom QRIS for user %s after retries: %s", user.id, exc)
         else:
             LOGGER.exception("Failed to create custom QRIS")
         try:
@@ -1320,7 +1422,7 @@ async def send_custom_qris_locked(event, config, store, qris_semaphore, user, am
         except Exception:
             LOGGER.warning("Failed to delete custom invoice message after create error", exc_info=True)
         if is_cloudflare_challenge(exc):
-            await event.respond("Custom QRIS belum bisa dibuat karena gateway pembayaran sedang membatasi request. Coba lagi beberapa menit lagi.")
+            await event.respond("Custom QRIS belum bisa dibuat karena sistem sedang membatasi request. Coba lagi beberapa menit lagi.")
             await send_log(
                 event.client,
                 config,
@@ -1341,6 +1443,20 @@ async def send_custom_qris_locked(event, config, store, qris_semaphore, user, am
                 (
                     "<b>Duplicate custom active payment blocked</b>\n"
                     f"User: {telegram_user_link(user)} (<code>{user.id}</code>)"
+                ),
+            )
+            return
+        if is_sociabuzz_timeout(exc):
+            await event.respond("Custom QRIS lagi lambat dibuat. Coba lagi sebentar lagi ya.")
+            await send_log(
+                event.client,
+                config,
+                store,
+                (
+                    "<b>Custom QRIS gateway timeout</b>\n"
+                    f"User: {telegram_user_link(user)} (<code>{user.id}</code>)\n"
+                    f"Amount: <code>{format_rupiah(amount)}</code>\n"
+                    f"Error: <code>{html.escape(str(exc))}</code>"
                 ),
             )
             return
@@ -1373,17 +1489,39 @@ async def credit_referral_if_needed(client, config, store, payment):
         ),
         parse_mode="html",
     )
+    referrer_row = store.get_user(referral["referrer_user_id"]) or {"user_id": referral["referrer_user_id"]}
+    payment_row = {
+        "user_id": payment["user_id"],
+        "username": payment.get("username") or "",
+        "full_name": payment.get("full_name") or str(payment["user_id"]),
+    }
     await send_log(
         client,
         config,
         store,
         (
-            "<b>Referral commission credited</b>\n\n"
-            f"<b>Yang Invite</b>\n{referral_user_log_text(store.get_user(referral['referrer_user_id']) or {'user_id': referral['referrer_user_id']})}\n\n"
-            f"<b>User yang Join</b>\n{user_link(payment)}\nUser ID: <code>{payment['user_id']}</code>\n\n"
-            f"Invoice: <code>{html.escape(payment.get('public_invoice_id') or payment['inv_id'])}</code>\n"
-            f"Package amount: <code>{format_rupiah(int(payment.get('package_amount') or 0))}</code>\n"
-            f"Commission: <code>{format_rupiah(commission)}</code>"
+            "<b>REFERRAL COMMISSION CREDITED</b>\n\n"
+            "<blockquote>"
+            "<b>INVITER</b>\n"
+            f"<b>Name</b>: {html.escape(referrer_row.get('full_name') or str(referrer_row.get('user_id')))}\n"
+            f"<b>Username</b>: {('@' + html.escape(referrer_row.get('username'))) if referrer_row.get('username') else '-'}\n"
+            f"<b>User ID</b>: {referrer_row.get('user_id')}"
+            "</blockquote>\n\n"
+            "<blockquote>"
+            "<b>USER INVITED</b>\n"
+            f"<b>Name</b>: {html.escape(payment.get('full_name') or str(payment['user_id']))}\n"
+            f"<b>User ID</b>: {payment['user_id']}"
+            "</blockquote>\n\n"
+            "<blockquote>"
+            "<b>TRANSACTION</b>\n"
+            f"<b>Invoice</b>: {html.escape(payment.get('public_invoice_id') or payment['inv_id'])}\n"
+            f"<b>Package</b>: {html.escape(payment.get('package_code') or '')} {html.escape(payment.get('package_name') or '')}\n"
+            f"<b>Package Amount</b>: {format_rupiah(int(payment.get('package_amount') or 0))}\n"
+            f"<b>Commission</b>: {format_rupiah(commission)}\n\n"
+            "Status: Success"
+            "</blockquote>\n\n"
+            f"User {plain_user_link(payment_row)} joined using Referral User {plain_user_link(referrer_row)}\n\n"
+            f"Referral Code: {html.escape(referrer_row.get('referral_code') or '')}"
         ),
     )
 
@@ -1474,13 +1612,15 @@ async def process_paid_payment(client, config, store, payment):
         config,
         store,
         (
-            "<b>Payment paid</b>\n"
-            f"User: {user_link(payment)} (<code>{payment['user_id']}</code>)\n"
-            f"Package: <code>{html.escape(payment.get('package_code') or '')}</code> {html.escape(payment.get('package_name') or '')}\n"
-            f"Invoice: <code>{html.escape(payment.get('public_invoice_id') or payment['inv_id'])}</code>\n"
-            f"Internal invoice: <code>{html.escape(payment['inv_id'])}</code>\n"
-            f"Invite link: <code>{html.escape(invite_link)}</code>\n"
-            f"Invite expires: <code>{html.escape(invite_expires_at)}</code>"
+            "<b>PAYMENT PAID</b>\n\n"
+            "<blockquote>"
+            f"<b>User</b>: {user_link(payment)} ({payment['user_id']})\n"
+            f"<b>Package</b>: {html.escape(payment.get('package_code') or '')} {html.escape(payment.get('package_name') or '')}\n"
+            f"<b>Invoice</b>: {html.escape(payment.get('public_invoice_id') or payment['inv_id'])}\n"
+            f"<b>Internal Invoice</b>: {html.escape(payment['inv_id'])}\n"
+            f"<b>Invite Link</b>: {html.escape(invite_link)}\n"
+            f"<b>Invite Link Expires</b>: {format_log_datetime(invite_expires_at)}"
+            "</blockquote>"
         ),
     )
 
@@ -1488,16 +1628,27 @@ async def process_paid_payment(client, config, store, payment):
 async def delete_qris_message(client, payment):
     chat_id = payment.get("qris_chat_id")
     message_id = payment.get("qris_message_id")
+    invoice_id = payment.get("public_invoice_id") or payment.get("inv_id")
     if not chat_id or not message_id:
         return
     try:
         await client.delete_messages(int(chat_id), [int(message_id)], revoke=True)
     except Exception as exc:
+        text = str(exc).lower()
+        if "service message" in text or "message id is invalid" in text or "could not find" in text:
+            LOGGER.info(
+                "QRIS message %s in chat %s for invoice %s was already unavailable or not deletable: %s",
+                message_id,
+                chat_id,
+                invoice_id,
+                exc,
+            )
+            return
         LOGGER.warning(
             "Failed to delete QRIS message %s in chat %s for invoice %s: %s",
             message_id,
             chat_id,
-            payment.get("public_invoice_id") or payment.get("inv_id"),
+            invoice_id,
             exc,
         )
 
@@ -1609,18 +1760,26 @@ async def expire_pending_payment(client, config, store, payment, title="Payment 
         parse_mode="html",
         buttons=package_buttons(config, store),
     )
-    await send_log(
-        client,
-        config,
-        store,
-        (
+    is_custom = not (payment.get("package_code") or payment.get("package_name"))
+    if is_custom:
+        log_text = (
+            "<b>Custom QRIS Expired</b>\n\n"
+            "<blockquote>"
+            f"<b>User</b>: {user_link(payment)} ({payment['user_id']})\n"
+            f"<b>Custom QRIS Amount</b>: {format_rupiah(int(payment.get('amount') or 0))}\n"
+            f"<b>Invoice</b>: {html.escape(payment.get('public_invoice_id') or payment['inv_id'])}\n"
+            f"<b>Internal Invoice</b>: {html.escape(payment['inv_id'])}"
+            "</blockquote>"
+        )
+    else:
+        log_text = (
             f"<b>{html.escape(title)}</b>\n"
-            f"User: {user_link(payment)} (<code>{payment['user_id']}</code>)\n"
-            f"Package: <code>{html.escape(payment.get('package_code') or '')}</code> {html.escape(payment.get('package_name') or '')}\n"
-            f"Invoice: <code>{html.escape(payment.get('public_invoice_id') or payment['inv_id'])}</code>\n"
-            f"Internal invoice: <code>{html.escape(payment['inv_id'])}</code>"
-        ),
-    )
+            f"User: {user_link(payment)} ({payment['user_id']})\n"
+            f"Package: {html.escape(payment.get('package_code') or '')} {html.escape(payment.get('package_name') or '')}\n"
+            f"Invoice: {html.escape(payment.get('public_invoice_id') or payment['inv_id'])}\n"
+            f"Internal invoice: {html.escape(payment['inv_id'])}"
+        )
+    await send_log(client, config, store, log_text)
 
 
 async def polling_loop(client, config, store):
