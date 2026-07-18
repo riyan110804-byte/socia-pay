@@ -3,13 +3,15 @@ from types import SimpleNamespace
 
 from telethon.tl.types import MessageEntityBold, MessageEntityItalic, MessageEntityTextUrl
 
-from telegram_vip_bot import (
+from vip_bot.messages import (
     admin_command_list_text,
-    entities_to_json,
-    format_referral_code,
     main_menu_keyboard_text,
     main_menu_button_labels,
     paid_message,
+)
+from vip_bot.helpers import (
+    entities_to_json,
+    format_referral_code,
     referral_user_log_text,
     parse_referral_payload,
     parse_withdrawal_amount,
